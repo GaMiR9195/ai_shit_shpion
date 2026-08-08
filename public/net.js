@@ -26,6 +26,24 @@
   const CURSOR_MS = 18;
   const OP_MS = 12;
 
+  /* ---- the room's clock ----
+
+     Two machines never agree on the time, and their clocks can be minutes
+     apart. Shared playback needs one second that means the same thing in
+     every window, so the server is asked what time it is and the answer is
+     corrected for half the round trip. Everything to do with watching
+     together is measured on Net.now() rather than Date.now(). */
+  let skew = 0;
+  let timeT = 0;
+  const now = () => Date.now() + skew;
+  function timeSync() { send({ type: "time", t0: Date.now() }); }
+  function onTime(m) {
+    const rtt = Math.max(0, Date.now() - (m.t0 || 0));
+    const off = (m.now || 0) + rtt / 2 - Date.now();
+    // a little averaging, so one slow packet does not move the clock
+    skew = skew === 0 ? off : skew * 0.5 + off * 0.5;
+  }
+
   let ws = null;
   let room = "main";
   let me = null;
@@ -78,6 +96,8 @@
       status("online");
       // anything queued while the room was down goes out now
       if (outbox.size) flush(true);
+      timeSync();
+      if (!timeT) timeT = setInterval(timeSync, 30000);
     };
 
     ws.onmessage = (ev) => {
@@ -95,6 +115,7 @@
       if (m.type === "leave") { dropPeer(m.id); return; }
       if (m.type === "cursor") { movePeer(m); return; }
       if (m.type === "ops") { if (hooks.ops) hooks.ops(m.ops || [], m.from); return; }
+      if (m.type === "time") { onTime(m); return; }
       if (m.type === "ping") { send({ type: "pong" }); return; }
     };
 
@@ -253,7 +274,7 @@
 
   const online = () => !!ws && ws.readyState === 1;
 
-  g.Net = { connect, disconnect, cursor, push, remove, flush, merge, paint, online,
+  g.Net = { connect, disconnect, cursor, push, remove, flush, merge, paint, online, now,
             get id() { return me; }, get color() { return myColor; }, get room() { return room; },
             peers };
 })(window);

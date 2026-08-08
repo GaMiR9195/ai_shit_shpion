@@ -182,6 +182,96 @@ const PROXY_MAX = 8 * 1024 * 1024;
 const PROXY_UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+const CORS = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET,POST,HEAD,OPTIONS",
+  "access-control-allow-headers": "*",
+  "access-control-expose-headers": "*",
+};
+
+/* ------------------------------------------------------------------ *
+ * the shim
+ *
+ * A fetched page is served from this board, inside a frame with no origin
+ * of its own. Three things break there, and all three end as the same
+ * blank "a client-side exception has occurred":
+ *
+ *   1. window.localStorage throws on the very first read. A modern site
+ *      reads it while booting, so the app dies before it draws anything.
+ *   2. history.pushState with a path throws, because that path belongs to
+ *      this board and not to the page. Any router calls it immediately.
+ *   3. Anything the page asks for by path — fetch("/api/…") — arrives here
+ *      instead of at the site, and comes back as 404 nonsense.
+ *
+ * So a small script goes in ahead of the page's own: storage that lives in
+ * memory when the real one is unavailable, history that survives a refused
+ * URL, requests routed back out through the fetcher, and service workers
+ * quietly declined. Nothing about the page itself is rewritten.
+ * ------------------------------------------------------------------ */
+const PROXY_SHIM = `<script>(function(){
+var HOST="__HOST__";
+var VIA="/api/proxy?url=";
+function via(u){
+  if(u==null)return u;
+  var s=String(u);
+  if(!s||s.charAt(0)==="#")return s;
+  if(/^(data:|blob:|about:|javascript:|mailto:|tel:)/i.test(s))return s;
+  var a;try{a=new URL(s,location.href).href;}catch(e){return s;}
+  if(a.indexOf(location.origin)===0){
+    var rest=a.slice(location.origin.length);
+    if(rest.indexOf("/api/proxy")===0)return a;
+    try{a=new URL(rest,HOST).href;}catch(e){return s;}
+  }
+  return VIA+encodeURIComponent(a);
+}
+function mem(){var m=Object.create(null);return{
+  getItem:function(k){return k in m?m[k]:null;},
+  setItem:function(k,v){m[k]=String(v);},
+  removeItem:function(k){delete m[k];},
+  clear:function(){m=Object.create(null);},
+  key:function(i){return Object.keys(m)[i]||null;},
+  get length(){return Object.keys(m).length;}};}
+["localStorage","sessionStorage"].forEach(function(n){
+  var ok=true;
+  try{var s=window[n];s.setItem("__probe","1");s.removeItem("__probe");}catch(e){ok=false;}
+  if(!ok){try{Object.defineProperty(window,n,{configurable:true,value:mem()});}catch(e){}}
+});
+["pushState","replaceState"].forEach(function(n){
+  var f=history[n];if(!f)return;
+  history[n]=function(a,b,u){
+    try{return f.call(history,a,b,u);}
+    catch(e){try{return f.call(history,a,b);}catch(e2){}}
+  };
+});
+try{if(navigator.serviceWorker&&navigator.serviceWorker.register)
+  navigator.serviceWorker.register=function(){return new Promise(function(){});};}catch(e){}
+var F=window.fetch;
+if(F)window.fetch=function(i,o){
+  try{
+    if(typeof i==="string")i=via(i);
+    else if(i&&i.url)i=new Request(via(i.url),i);
+  }catch(e){}
+  return F.call(this,i,o);
+};
+var X=XMLHttpRequest.prototype.open;
+XMLHttpRequest.prototype.open=function(){
+  var a=[].slice.call(arguments);
+  try{a[1]=via(a[1]);}catch(e){}
+  return X.apply(this,a);
+};
+if(navigator.sendBeacon){var B=navigator.sendBeacon.bind(navigator);
+  navigator.sendBeacon=function(u,d){try{u=via(u);}catch(e){}return B(u,d);};}
+var W=window.WebSocket;
+if(W){
+  var P=function(u,p){
+    var a=u;try{a=new URL(String(u),HOST.replace(/^http/,"ws")).href;}catch(e){}
+    return p===undefined?new W(a):new W(a,p);
+  };
+  P.prototype=W.prototype;
+  P.CONNECTING=W.CONNECTING;P.OPEN=W.OPEN;P.CLOSING=W.CLOSING;P.CLOSED=W.CLOSED;
+  window.WebSocket=P;
+}
+})();</scr` + `ipt>`;
 
 async function proxyPage(req, res, raw) {
   if (typeof fetch !== "function") return send(res, 501, { error: "needs node 18+" });
@@ -189,17 +279,28 @@ async function proxyPage(req, res, raw) {
   try { target = new URL(String(raw || "")); } catch (e) { return send(res, 400, { error: "bad url" }); }
   if (target.protocol !== "http:" && target.protocol !== "https:") return send(res, 400, { error: "bad url" });
 
+  const method = req.method === "HEAD" ? "GET" : (req.method || "GET");
+  // a page that posts a form or a search query gets its body carried along
+  const body = await new Promise((ok) => {
+    if (method === "GET" || method === "HEAD") return ok(undefined);
+    const parts = [];
+    let n = 0;
+    req.on("data", (c) => { n += c.length; if (n <= PROXY_MAX) parts.push(c); });
+    req.on("end", () => ok(parts.length ? Buffer.concat(parts) : undefined));
+    req.on("error", () => ok(undefined));
+  });
+
+  const head = {
+    // asking as a browser would: a bare fetch gets a wall from many sites
+    "user-agent": PROXY_UA,
+    accept: String(req.headers.accept || "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+    "accept-language": String(req.headers["accept-language"] || "en"),
+  };
+  if (req.headers["content-type"]) head["content-type"] = String(req.headers["content-type"]);
+
   let up;
   try {
-    up = await fetch(target.href, {
-      redirect: "follow",
-      headers: {
-        // asking as a browser would: a bare fetch gets a wall from many sites
-        "user-agent": PROXY_UA,
-        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "accept-language": String(req.headers["accept-language"] || "en"),
-      },
-    });
+    up = await fetch(target.href, { method, headers: head, body, redirect: "follow" });
   } catch (e) {
     return send(res, 502, { error: "could not reach that page" });
   }
@@ -214,21 +315,25 @@ async function proxyPage(req, res, raw) {
 
   // anything that is not a document is passed straight back through
   if (!/^text\/html|^application\/xhtml/i.test(type)) {
-    res.writeHead(code, { "content-type": type, "cache-control": "public, max-age=300" });
-    return void res.end(buf);
+    res.writeHead(code, Object.assign({ "content-type": type, "cache-control": "public, max-age=300" }, CORS));
+    return void res.end(method === "HEAD" ? undefined : buf);
   }
 
   let html = buf.toString("utf8");
-  const base = '<base href="' + up.url.replace(/"/g, "&quot;") + '">';
-  // drop the page's own framing rules, then anchor its relative links
+  const origin = new URL(up.url || target.href).origin;
+  const base = '<base href="' + (up.url || target.href).replace(/"/g, "&quot;") + '">';
+  const shim = PROXY_SHIM.replace("__HOST__", origin);
+  // the page's own framing and upgrade rules are the browser's business,
+  // and here they only stand in the way
   html = html.replace(/<meta[^>]+http-equiv=["\']?content-security-policy["\']?[^>]*>/gi, "");
-  html = /<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, (m) => m + base) : base + html;
+  html = /<head[^>]*>/i.test(html)
+    ? html.replace(/<head[^>]*>/i, (m) => m + base + shim)
+    : base + shim + html;
 
-  res.writeHead(code, {
+  res.writeHead(code, Object.assign({
     "content-type": "text/html; charset=utf-8",
     "cache-control": "no-store",
-    "referrer-policy": "no-referrer",
-  });
+  }, CORS));
   res.end(html);
 }
 
@@ -242,7 +347,11 @@ const server = http.createServer(async (req, res) => {
     if (url === "/api/health") {
       return send(res, 200, { ok: true, pretext: !!vendorEntry, rooms: rooms.size });
     }
-    if (url.startsWith("/api/proxy") && (req.method === "GET" || req.method === "HEAD")) {
+    if (url.split("?")[0] === "/api/proxy") {
+      if (req.method === "OPTIONS") {
+        res.writeHead(204, Object.assign({ "access-control-max-age": "600" }, CORS));
+        return void res.end();
+      }
       const q = new URL(url, "http://board.local").searchParams.get("url");
       return void (await proxyPage(req, res, q));
     }
@@ -257,6 +366,20 @@ const server = http.createServer(async (req, res) => {
       const file = safeJoin(vendorRoot, url.slice("/vendor/pretext".length));
       if (file && (await sendFile(res, file, { cache: "public, max-age=31536000, immutable" }))) return;
       return send(res, 404, { error: "not found" });
+    }
+
+    /* Something a fetched page asked for by path. The document is served
+       from here, so "/whatever" lands on this board rather than on the site
+       it belongs to; when the browser still tells us which page asked, the
+       path is resolved against that site instead. The shim inside the page
+       catches most of these first — this is the net underneath it. */
+    const ref = String(req.headers.referer || "");
+    const hop = ref.indexOf("/api/proxy?url=");
+    if (hop >= 0 && !url.startsWith("/api/") && !url.startsWith("/vendor/")) {
+      const site = decodeURIComponent(ref.slice(hop + "/api/proxy?url=".length).split("&")[0]);
+      let out = null;
+      try { out = new URL(url, site).href; } catch (e) { out = null; }
+      if (out) return void (await proxyPage(req, res, out));
     }
 
     // index gets the import map injected
@@ -385,6 +508,12 @@ wss.on("connection", (ws, req) => {
       others({ type: "ops", from: peer.id, ops: applied });
       return;
     }
+
+    /* What time it is in the room. The reply carries the moment the ask
+       was sent back with it, so the window can subtract its own round trip
+       and end up on the same clock as everybody else. Shared playback is
+       built on this. */
+    if (msg.type === "time") { tell({ type: "time", t0: msg.t0, now: Date.now() }); return; }
 
     if (msg.type === "pong") peer.alive = true;
   });

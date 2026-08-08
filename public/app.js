@@ -424,6 +424,7 @@
       : `translate(${x}px,${y}px)`;
     el.style.width = px(o._w == null ? o.w : o._w) + "px";
     el.style.height = px(o._h == null ? o.h : o._h) + "px";
+    if (o.frame === "fit") fitFrame(o, el);
     el.style.boxShadow = lift > 0.002
       ? `0 ${(1 + lift * 3).toFixed(2)}px ${(2 + lift * 6).toFixed(2)}px rgba(0,0,0,.42),` +
         `0 ${(8 + lift * 18).toFixed(2)}px ${(24 + lift * 26).toFixed(2)}px rgba(0,0,0,${(0.28 + lift * 0.16).toFixed(3)})`
@@ -569,6 +570,11 @@
         const rn = btn("Render", !!o.render);
         rn.onclick = () => { snapshot(); o.render = !o.render; paint(o); save(); Sync.obj(o); rebuildRail(o); };
         rail.append(rn);
+        if (o.render) {
+          const fr = btn(o.frame === "fit" ? "Fit" : "Fill");
+          fr.onclick = () => { o.frame = o.frame === "fit" ? "fill" : "fit"; paint(o); save(); Sync.obj(o); rebuildRail(o); };
+          rail.append(fr);
+        }
       }
     }
 
@@ -1008,6 +1014,79 @@
     ta.scrollTop = top;
   }
 
+  /* ------------------------------------------------------------------ *
+   * shared cinema
+   *
+   * A video card carries two things beside its source: where the clip is
+   * (at) and when that was true on the room's clock (pt). Anybody can work
+   * out from those where the clip should be right now, including a window
+   * that arrives in the middle of it, so play, pause and scrubbing land in
+   * every window at once and everyone watches the same second.
+   *
+   * Nothing is broadcast on a timer: only the moments that change the
+   * story — a press on play, a pause, a seek. Drift is corrected quietly
+   * against the same clock while the clip runs.
+   *
+   * Sound is the one thing a browser will not start on its own. A muted
+   * card plays everywhere; an unmuted one waits for a press in the window
+   * that has it unmuted, which is the browser's rule, not this board's.
+   * ------------------------------------------------------------------ */
+  const netNow = () => (typeof Net !== "undefined" && Net.now ? Net.now() : Date.now());
+
+  /* where the clip should be, from what the room last said */
+  function cinemaAt(o) {
+    let at = o.at || 0;
+    if (o.play && o.pt) at += Math.max(0, (netNow() - o.pt) / 1000);
+    return at;
+  }
+
+  function cinema(m, o, slack) {
+    if (o.pt == null && o.at == null) return;   // nobody has pressed anything yet
+    let want = cinemaAt(o);
+    const dur = m.duration;
+    if (dur && isFinite(dur) && want > dur) want = o.loop ? want % dur : dur;
+    if (isFinite(want) && m.readyState > 0 && Math.abs((m.currentTime || 0) - want) > slack) {
+      try { m.currentTime = want; } catch (e) { /* not seekable yet */ }
+    }
+    if (o.play && m.paused) { const p = m.play(); if (p && p.catch) p.catch(() => {}); }
+    else if (!o.play && !m.paused) m.pause();
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Frame: fit or fill
+   *
+   * fill lays the page out at the card's own size, like a small browser
+   * window: a desktop site reflows into a narrow column, and its own
+   * proportions are gone.
+   *
+   * fit gives the page a full desktop width and shrinks the whole picture
+   * into the card, the way a clip sits in its frame. The layout is the one
+   * the site was built for, only smaller.
+   * ------------------------------------------------------------------ */
+  const FIT_W = 1280;
+  function fitFrame(o, host) {
+    const el = host || nodes.get(o.id);
+    if (!el) return;
+    const f = el.querySelector("iframe");
+    if (!f) return;
+    if (o.frame !== "fit") {
+      f.style.width = ""; f.style.height = "";
+      f.style.transform = ""; f.style.transformOrigin = "";
+      return;
+    }
+    /* measured off the box the frame actually sits in, so this is right for
+       a page card and for a rendered code card alike, and stays right while
+       the card is being resized */
+    const box = f.parentNode.getBoundingClientRect();
+    const z = cam().z || 1;
+    const w = Math.max(1, box.width / z), h = Math.max(1, box.height / z);
+    const k = w / FIT_W;
+    f.style.width = FIT_W + "px";
+    f.style.height = Math.round(h / k) + "px";
+    f.style.transformOrigin = "0 0";
+    f.style.transform = "scale(" + k.toFixed(4) + ")";
+  }
+
   /* content refresh (never rebuilds the node while it is being edited) */
   function paint(o) {
     const el = nodes.get(o.id); if (!el) return;
@@ -1046,6 +1125,7 @@
         }
         // reloading on every repaint would restart the page mid-use
         if (run.dataset.src !== (o.src || "")) { run.dataset.src = o.src || ""; run.srcdoc = o.src || ""; }
+        fitFrame(o, el);
         view.hidden = true; ta.hidden = true;
         if (hl) hl.hidden = true;
       } else {
@@ -1103,7 +1183,26 @@
           m.addEventListener("play", follow);
           m.addEventListener("pause", follow);
           m.addEventListener("ended", follow);
+
+          /* Telling the room where the clip is. The guard is what keeps two
+             windows from pushing each other around: a play or a seek that
+             only happened because the room asked for it already matches
+             what the card says, so it is not sent back out. */
+          const tell = () => {
+            const cur = m.currentTime || 0;
+            if (!!o.play === !m.paused && Math.abs(cinemaAt(o) - cur) < 0.35) return;
+            o.play = !m.paused;
+            o.at = cur;
+            o.pt = netNow();
+            save(); Sync.obj(o);
+          };
+          m.addEventListener("play", tell);
+          m.addEventListener("pause", tell);
+          m.addEventListener("seeked", tell);
+          // clips drift apart over a long watch; this pulls them back
+          m.addEventListener("timeupdate", () => cinema(m, o, 1.6));
         }
+        cinema(m, o, 0.45);
       } else {
         // an off-screen embed should not be booting a player either
         m.loading = "lazy";
@@ -1144,12 +1243,12 @@
           /* Sandboxed: scripts and forms work, so the page is genuinely
              usable, but it cannot reach this document or its storage. */
           f.setAttribute("sandbox", "allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox");
-          f.setAttribute("referrerpolicy", "no-referrer");
           f.loading = "lazy";
           inner.appendChild(f);
         }
         const want = frameSrc(href);
         if (f.getAttribute("src") !== want) f.setAttribute("src", want);
+        fitFrame(o, el);
       } else {
         let card = inner.querySelector(".card");
         if (!card) {
@@ -1234,7 +1333,7 @@
     return add({ type: "video", w: 360, h: 216, src, kind: kind || "file", fit: "cover", loop: false, muted: true, controls: true }, at);
   }
   const mkFile = (at, extra) => add(Object.assign({ type: "file", w: 192, h: 156 }, extra), at);
-  const mkWeb = (src, at, extra) => add(Object.assign({ type: "web", w: 420, h: 300, src, render: false }, extra), at);
+  const mkWeb = (src, at, extra) => add(Object.assign({ type: "web", w: 420, h: 300, src, render: false, frame: "fill" }, extra), at);
   const hostOf = (u) => { try { return new URL(u, location.href).host; } catch (e) { return ""; } };
 
   /* A code card that is really a page: markup, either by its language tag or
@@ -2956,6 +3055,7 @@
       items.push({ label: o.md ? "Markdown: on" : "Markdown: off", run: () => { snapshot(); o.md = !o.md; paint(o); save(); rebuildRail(o); } });
       items.push({ label: o.wrap ? "Wrap: on" : "Wrap: off", run: () => { o.wrap = !o.wrap; paint(o); save(); rebuildRail(o); } });
       if (canRender(o)) items.push({ label: o.render ? "Render: on" : "Render: off", run: () => { snapshot(); o.render = !o.render; paint(o); save(); Sync.obj(o); rebuildRail(o); } });
+      if (canRender(o) && o.render) items.push({ label: o.frame === "fit" ? "Frame: fit" : "Frame: fill", run: () => { o.frame = o.frame === "fit" ? "fill" : "fit"; paint(o); save(); Sync.obj(o); rebuildRail(o); } });
       items.push({ label: "Rename", run: () => renameNow(o, ".fname") });
       items.push({ sep: 1 });
     }
@@ -3004,8 +3104,9 @@
     if (o.type === "web") {
       /* Off until you say otherwise: a page arrives as a bookmark, and only
          runs — sandboxed — once rendering is turned on. */
-      items.push({ label: o.render ? "Render: on" : "Render: off", run: () => { snapshot(); o.render = !o.render; paint(o); save(); Sync.obj(o); } });
       items.push({ text: { label: "Link", value: /^https?:/.test(o.src || "") ? o.src : "", run: (v) => { snapshot(); o.src = v; o.ref = null; o.url = ""; o.name = ""; paint(o); save(); Sync.obj(o); } } });
+      items.push({ label: o.render ? "Render: on" : "Render: off", run: () => { snapshot(); o.render = !o.render; paint(o); save(); Sync.obj(o); } });
+      items.push({ label: o.frame === "fit" ? "Frame: fit" : "Frame: fill", run: () => { o.frame = o.frame === "fit" ? "fill" : "fit"; paint(o); save(); Sync.obj(o); } });
       items.push({ sep: 1 });
     }
 

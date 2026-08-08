@@ -317,7 +317,9 @@ button,select,textarea,input,[contenteditable]{-webkit-tap-highlight-color:trans
    Off, it is a card with an address on it. On, the page is live and you
    use it. Nothing else changes between the two states. */
 .web{background:#0f0f0f}
-.web .inner{padding:0;position:relative}
+/* a page scaled down to fit is laid out wider than the card, so the card
+   is what decides where it ends */
+.web .inner{padding:0;position:relative;overflow:hidden}
 .web iframe{width:100%;height:100%;border:0;display:block;background:#fff;border-radius:inherit}
 .web .card{flex:1;display:flex;flex-direction:column;justify-content:center;gap:9px;padding:16px}
 .web .card svg{width:26px;height:26px;flex:0 0 auto;stroke:rgba(233,231,228,.6);fill:none;
