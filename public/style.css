@@ -233,6 +233,12 @@ button,select,textarea,input,[contenteditable]{-webkit-tap-highlight-color:trans
   background:transparent;color:transparent;caret-color:#e9e7e4;overflow:auto;z-index:1}
 .code textarea::selection{background:rgba(233,231,228,.22);color:transparent}
 .code textarea::placeholder{color:var(--ink-3)}
+/* Render on: the page takes the pad the source was in — same box, same
+   border, nothing added around it. Dead to the pointer until the card is
+   selected, so the card can still be picked up by its middle. */
+.code .pad iframe{position:absolute;inset:0;width:100%;height:100%;border:0;display:block;
+  background:#fff;pointer-events:none}
+.code.sel .pad iframe{pointer-events:auto}
 
 .code .view{flex:1;overflow:auto;padding:0;font-size:13px;color:rgba(233,231,228,.86)}
 .code .view>:first-child{margin-top:0}

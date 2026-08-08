@@ -18,8 +18,13 @@
 (function (g) {
   "use strict";
 
-  const CURSOR_MS = 40;
-  const OP_MS = 55;
+  /* Both of these used to be long enough to see. A keystroke that waits
+     55ms behind a coalescing window arrives as a word rather than a
+     letter, so the window is now about one frame: changes leave on the
+     next tick and the other window paints them the same frame it gets
+     them. Cursors go out at the same rate. */
+  const CURSOR_MS = 18;
+  const OP_MS = 12;
 
   let ws = null;
   let room = "main";

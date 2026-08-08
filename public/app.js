@@ -124,9 +124,20 @@
           render(); kick(); rehydrate(); shareAll(); save();
         },
         onOps(ops) {
-          let dirty = false;
-          for (const op of ops) { Sync.seen(op); if (applyOp(op)) dirty = true; }
-          if (dirty) { render(); kick(); rehydrate(); save(); }
+          let dirty = false, bytes = false;
+          for (const op of ops) {
+            Sync.seen(op);
+            const f = op && op.f;
+            if (f && (f.ref !== undefined || f.url !== undefined || f.items !== undefined)) bytes = true;
+            if (applyOp(op)) dirty = true;
+          }
+          if (!dirty) return;
+          /* Paint first and paint always: a batch that arrives while you are
+             typing in the same card is a character, not a reload. Fetching
+             bytes is the slow part, so it only runs for a record that
+             actually names some. */
+          render(); kick(); save();
+          if (bytes) rehydrate();
         },
       });
     },
@@ -166,7 +177,19 @@
       return true;
     }
     const changed = Net.merge(o, op);
-    if (changed) { o._x = o.x; o._y = o.y; o._w = o.w; o._h = o.h; }
+    /* Display state is deliberately left alone. It used to be slammed onto
+       the incoming values, which is why a card somebody else moved jumped
+       from place to place: the springs in tick() had nothing left to do.
+       Now the same springs that animate your own drags animate theirs, so
+       you watch their card travel. Only a jump too far to be motion is
+       taken as a teleport and landed on directly. */
+    if (changed && isBox(o)) {
+      if (o._x == null) sync(o);
+      else if (Math.hypot(o.x - o._x, o.y - o._y) > 2600) {
+        o._x = o.x; o._y = o.y; o._w = o.w; o._h = o.h;
+        o._vx = 0; o._vy = 0; o._vw = 0; o._vh = 0;
+      }
+    }
     return changed;
   }
 
@@ -297,7 +320,10 @@
 
   function camStep(dt) {
     const c = cam();
-    const k = 1 - Math.exp(-dt * 21);
+    /* How hard the view is pulled onto where it is going. High enough to
+       feel attached to the pointer, low enough that a pan glides to a stop
+       instead of stopping dead. */
+    const k = 1 - Math.exp(-dt * 26);
     let moved = false;
     for (const a of ["x", "y", "z"]) {
       const d = camT[a] - c[a];
@@ -537,6 +563,13 @@
       const cp = btn("Copy");
       cp.onclick = () => copyObject(o);
       rail.append(md, wrap, cp);
+      /* One button for markup: the source, or the page it is. Only markup
+         cards get it, so nothing changes on a card of Python. */
+      if (canRender(o)) {
+        const rn = btn("Render", !!o.render);
+        rn.onclick = () => { snapshot(); o.render = !o.render; paint(o); save(); Sync.obj(o); rebuildRail(o); };
+        rail.append(rn);
+      }
     }
 
     if (o.type === "image") {
@@ -703,7 +736,10 @@
          download by name. */
       const b = document.createElement("div");
       b.className = "body"; b.contentEditable = "true"; b.spellcheck = false; b.textContent = o.body || "";
-      const commit = () => { o.body = b.innerText.replace(/\n$/, ""); save(); };
+      /* Every keystroke leaves for the room straight away, and the save to
+         local storage stays debounced behind it. Typing used to be the one
+         change nobody else ever saw. */
+      const commit = () => { o.body = b.innerText.replace(/\n$/, ""); Sync.obj(o); save(); };
       b.addEventListener("input", commit);
       [b].forEach((n) => {
         n.addEventListener("focus", () => el.classList.add("focus"));
@@ -774,7 +810,7 @@
       renameOn(name, () => o.name || "", (v) => { snapshot(); o.name = v; paint(o); save(); Sync.obj(o); },
         () => { snapshot(); o.name = ""; paint(o); save(); Sync.obj(o); });
 
-      ta.addEventListener("input", () => { o.src = ta.value; paintHL(o); save(); });
+      ta.addEventListener("input", () => { o.src = ta.value; paintHL(o); Sync.obj(o); save(); });
       ta.addEventListener("focus", () => el.classList.add("focus"));
       ta.addEventListener("blur", () => { el.classList.remove("focus"); if (o.md) paint(o); });
       ta.addEventListener("keydown", (e) => {
@@ -784,14 +820,22 @@
           const s = ta.selectionStart, en = ta.selectionEnd;
           ta.value = ta.value.slice(0, s) + "  " + ta.value.slice(en);
           ta.selectionStart = ta.selectionEnd = s + 2;
-          o.src = ta.value; save();
+          o.src = ta.value; paintHL(o); Sync.obj(o); save();
         }
         if (e.key === "Escape") ta.blur();
       });
       // markdown preview: click to go back to the untouched source
       view.addEventListener("click", (e) => {
-        if (e.target.tagName === "A") return;
-        view.hidden = true; ta.hidden = false; ta.focus();
+        if (e.target.closest("a")) return;
+        /* The textarea draws its text in transparent ink: what you read while
+           editing is the coloured layer underneath it, and rendering markdown
+           had hidden that layer. Revealing and repainting it here is why the
+           card no longer goes blank the moment you click into it. */
+        view.hidden = true; ta.hidden = false;
+        const hl = el.querySelector(".hlbg");
+        if (hl) hl.hidden = false;
+        paintHL(o);
+        ta.focus();
       });
     }
 
@@ -892,12 +936,84 @@
     return el;
   }
 
+  /* ------------------------------------------------------------------ *
+   * live text
+   *
+   * Two people typing in one card at the same time. The field is rewritten
+   * with what the room says, and the caret is put back where it was in the
+   * text rather than at the same index: characters typed before it push it
+   * along, characters typed after it leave it alone. That is the whole
+   * trick — without it a remote keystroke would either be ignored while
+   * the field has focus (what used to happen) or throw your cursor to the
+   * end of the line every time somebody else pressed a key.
+   * ------------------------------------------------------------------ */
+  let composing = false;
+  addEventListener("compositionstart", () => { composing = true; }, true);
+  addEventListener("compositionend", () => { composing = false; }, true);
+
+  /* where the caret moves to when the text around it changed */
+  function slide(was, now, at) {
+    const max = Math.min(was.length, now.length);
+    let head = 0;
+    while (head < max && was[head] === now[head]) head++;
+    if (at <= head) return at;
+    let tail = 0;
+    while (tail < max - head && was[was.length - 1 - tail] === now[now.length - 1 - tail]) tail++;
+    if (at >= was.length - tail) return at + (now.length - was.length);
+    return Math.min(at, now.length);
+  }
+
+  function caretAt(node) {
+    const sel = getSelection();
+    if (!sel || !sel.rangeCount) return null;
+    const r = sel.getRangeAt(0);
+    if (!node.contains(r.endContainer)) return null;
+    const probe = document.createRange();
+    probe.selectNodeContents(node);
+    probe.setEnd(r.endContainer, r.endOffset);
+    return probe.toString().length;
+  }
+
+  function putCaret(node, at) {
+    const walk = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+    let left = at, last = null, r = document.createRange();
+    while (walk.nextNode()) {
+      const t = walk.currentNode; last = t;
+      if (left <= t.nodeValue.length) { r.setStart(t, left); r.collapse(true); break; }
+      left -= t.nodeValue.length;
+      r = document.createRange();
+      r.setStart(t, t.nodeValue.length); r.collapse(true);
+    }
+    if (!last) { r.selectNodeContents(node); r.collapse(false); }
+    const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+  }
+
+  function setLiveText(node, text) {
+    const live = document.activeElement === node;
+    if (live && composing) return;
+    const at = live ? caretAt(node) : null;
+    const was = node.innerText.replace(/\n$/, "");
+    node.textContent = text;
+    if (live && at != null) putCaret(node, Math.max(0, Math.min(text.length, slide(was, text, at))));
+  }
+
+  function setLiveValue(ta, text) {
+    const live = document.activeElement === ta;
+    if (live && composing) return;
+    if (!live) { ta.value = text; return; }
+    const was = ta.value, a = ta.selectionStart, b = ta.selectionEnd, top = ta.scrollTop;
+    ta.value = text;
+    ta.selectionStart = Math.max(0, Math.min(text.length, slide(was, text, a)));
+    ta.selectionEnd = Math.max(0, Math.min(text.length, slide(was, text, b)));
+    ta.scrollTop = top;
+  }
+
   /* content refresh (never rebuilds the node while it is being edited) */
   function paint(o) {
     const el = nodes.get(o.id); if (!el) return;
     if (o.type === "note") {
       const b = el.querySelector(".body");
-      if (document.activeElement !== b && b.innerText !== (o.body || "")) b.textContent = o.body || "";
+      if (b.innerText.replace(/\n+$/, "") !== (o.body || "").replace(/\n+$/, "")) setLiveText(b, o.body || "");
       b.style.fontSize = (o.size || 13.5) + "px";
       b.style.fontFamily = o.mono ? "var(--mono)" : "var(--sans)";
     }
@@ -905,7 +1021,7 @@
     if (o.type === "code") {
       const ta = el.querySelector("textarea"), view = el.querySelector(".view"), nm = el.querySelector(".fname");
       const hl = el.querySelector(".hlbg");
-      if (document.activeElement !== ta && ta.value !== (o.src || "")) ta.value = o.src || "";
+      if (ta.value !== (o.src || "")) setLiveValue(ta, o.src || "");
       ta.style.whiteSpace = o.wrap ? "pre-wrap" : "pre";
       if (hl) hl.style.whiteSpace = o.wrap ? "pre-wrap" : "pre";
       // never rewrite the name while it is being typed into
@@ -913,17 +1029,39 @@
         nm.hidden = !o.name;
         if (o.name) nm.textContent = o.name;
       }
-      if (o.md && document.activeElement !== ta) {
-        /* A math card is typeset rather than highlighted: `math`, `tex` and
-           `latex` go through KaTeX, exactly like $…$ inside markdown. */
-        view.innerHTML = MD.isMathLang(o.lang)
-          ? MD.mathBlock(o.src || "")
-          : MD.render(o.src || "", o.lang);
-        view.hidden = false; ta.hidden = true;
+      /* Render is a code card's third state: the source, the markdown, or
+         the page itself running in the same pad. Turning it off leaves the
+         source exactly as it was — the string is never touched. */
+      const pad = el.querySelector(".pad");
+      const live = !!o.render && canRender(o);
+      let run = pad.querySelector("iframe");
+      if (live) {
+        if (!run) {
+          run = document.createElement("iframe");
+          /* Sandboxed: scripts and forms work, so the page is genuinely
+             usable, but it cannot reach this document or its storage. */
+          run.setAttribute("sandbox", "allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox");
+          run.setAttribute("referrerpolicy", "no-referrer");
+          pad.appendChild(run);
+        }
+        // reloading on every repaint would restart the page mid-use
+        if (run.dataset.src !== (o.src || "")) { run.dataset.src = o.src || ""; run.srcdoc = o.src || ""; }
+        view.hidden = true; ta.hidden = true;
         if (hl) hl.hidden = true;
       } else {
-        view.hidden = true; ta.hidden = false;
-        if (hl) { hl.hidden = false; paintHL(o); }
+        if (run) run.remove();
+        if (o.md && document.activeElement !== ta) {
+          /* A math card is typeset rather than highlighted: `math`, `tex` and
+             `latex` go through KaTeX, exactly like $…$ inside markdown. */
+          view.innerHTML = MD.isMathLang(o.lang)
+            ? MD.mathBlock(o.src || "")
+            : MD.render(o.src || "", o.lang);
+          view.hidden = false; ta.hidden = true;
+          if (hl) hl.hidden = true;
+        } else {
+          view.hidden = true; ta.hidden = false;
+          if (hl) { hl.hidden = false; paintHL(o); }
+        }
       }
     }
     if (o.type === "image") {
@@ -1010,7 +1148,8 @@
           f.loading = "lazy";
           inner.appendChild(f);
         }
-        if (f.getAttribute("src") !== href) f.setAttribute("src", href);
+        const want = frameSrc(href);
+        if (f.getAttribute("src") !== want) f.setAttribute("src", want);
       } else {
         let card = inner.querySelector(".card");
         if (!card) {
@@ -1097,6 +1236,29 @@
   const mkFile = (at, extra) => add(Object.assign({ type: "file", w: 192, h: 156 }, extra), at);
   const mkWeb = (src, at, extra) => add(Object.assign({ type: "web", w: 420, h: 300, src, render: false }, extra), at);
   const hostOf = (u) => { try { return new URL(u, location.href).host; } catch (e) { return ""; } };
+
+  /* A code card that is really a page: markup, either by its language tag or
+     by the way the text starts. This is the whole test behind Render —
+     everything else about the card stays a code card. */
+  function canRender(o) {
+    if (!o || o.type !== "code") return false;
+    const l = String(o.lang || "").toLowerCase();
+    if (l === "html" || l === "htm" || l === "xhtml" || l === "svg") return true;
+    return /^\s*<(?:!doctype\s+html|html|svg)\b/i.test(o.src || "");
+  }
+
+  /* What an iframe is actually given. A copy held here is framed as it is; a
+     site out on the web goes through this board's own fetcher, because most
+     sites forbid being framed and the browser then shows "refused to
+     connect" instead of the page. That refusal is the browser obeying a
+     header; fetched by the server and served from this origin, the same
+     page frames fine. */
+  function frameSrc(href) {
+    const u = String(href || "");
+    if (!u || !/^https?:\/\//i.test(u)) return u;
+    if (u.slice(0, location.origin.length) === location.origin) return u;
+    return "/api/proxy?url=" + encodeURIComponent(u);
+  }
 
   /* ------------------------------------------------------------------ *
    * shelves — the one card that holds other files
@@ -1360,18 +1522,14 @@
     f.type === "application/xhtml+xml";
 
   async function handleFile(f, at) {
-    /* A page dropped on the board is the page, not its source. It arrives
-       with rendering off — a bookmark card — so nothing inside it runs
-       until you turn it on, and then only inside a sandbox. */
-    if (isHTML(f)) {
-      let rec = null;
-      try { rec = await Store.put(f); }
-      catch (e) { console.warn("[space] local file store failed", e); }
-      const o = mkWeb(rec ? rec.url : await blobURL(f).catch(() => ""), at,
-        { name: f.name, mime: f.type || "text/html", size: f.size });
-      if (rec) o.ref = rec.ref;
-      paint(o); save();
-      if (rec) await shareOne(o);
+    /* A page dropped on the board is a code card like any other file of
+       text: its source, highlighted, wearing one extra button. It used to
+       arrive as a framed blob, which is why it looked like a mess of markup
+       nobody could read or edit. Nothing in it runs until Render is
+       pressed, and then only inside a sandbox. */
+    if (isHTML(f) && f.size < 2 * 1024 * 1024) {
+      const src = await f.text();
+      mkCode(at, { src, lang: "html", name: f.name, render: false, h: codeHeight(src, 420) });
       return;
     }
 
@@ -2797,6 +2955,7 @@
       // the language is the small tag on the rail: click it and type
       items.push({ label: o.md ? "Markdown: on" : "Markdown: off", run: () => { snapshot(); o.md = !o.md; paint(o); save(); rebuildRail(o); } });
       items.push({ label: o.wrap ? "Wrap: on" : "Wrap: off", run: () => { o.wrap = !o.wrap; paint(o); save(); rebuildRail(o); } });
+      if (canRender(o)) items.push({ label: o.render ? "Render: on" : "Render: off", run: () => { snapshot(); o.render = !o.render; paint(o); save(); Sync.obj(o); rebuildRail(o); } });
       items.push({ label: "Rename", run: () => renameNow(o, ".fname") });
       items.push({ sep: 1 });
     }
@@ -3184,15 +3343,21 @@
 
   function startPan(e) {
     const sx = e.clientX, sy = e.clientY;
-    const c = cam(), x0 = c.x, y0 = c.y;
+    const x0 = camT.x, y0 = camT.y;
     app.classList.add("panning");
+    /* The drag says where the view is going, never where it is. The camera
+       eases onto that target in the frame loop, so panning has the same
+       slight glide zooming has instead of being nailed to the pointer —
+       one frame of give, no more, and it keeps up with a fast flick
+       because the target is absolute rather than accumulated. */
     const move = (ev) => {
-      c.x = x0 + (ev.clientX - sx); c.y = y0 + (ev.clientY - sy);
-      syncCam(); applyCam();
-      doc.objs.forEach((o) => { if (isBox(o)) place(o); });
+      camT.x = x0 + (ev.clientX - sx);
+      camT.y = y0 + (ev.clientY - sy);
+      kick();
     };
     const up = () => {
       app.classList.remove("panning");
+      kick();
       save();
     };
     pointerSession({ move, up });
@@ -3337,42 +3502,66 @@
     pointerSession({ move, up, grab: true });
   }
 
-  /* grabbing the ribbon itself: pull the nearest node, or drop a new one
-     right where you grabbed if there is nothing close */
-  function startBend(e, o) {
-    const p = toWorld(e.clientX, e.clientY);
-    const near = 18 / cam().z;
+  /* Put a point on a shape where the pointer is, and answer with the handle
+     that now belongs to it so the same press can carry it away. */
+  function addNodeAt(o, p) {
     if (o.type === "link") {
       const F = linkFrame(o);
-      if (!F) return;
-      let bi = -1, bd = Infinity;
-      F.mids.forEach((m, i) => { const d = G.dist(m, p); if (d < bd) { bd = d; bi = i; } });
-      if (bi >= 0 && bd < near) return startNodeDrag(o, "mid", bi);
+      if (!F) return null;
       snapshot();
       const l = linkLocal(F, p);
       o.mid = o.mid || [];
       let at = o.mid.findIndex((m) => m.t > l.t);
       if (at < 0) at = o.mid.length;
       o.mid.splice(at, 0, l);
-      drawVectors();
-      return startNodeDrag(o, "mid", at);
+      drawVectors(); save(); Sync.obj(o);
+      return { key: "mid", i: at };
     }
-    if (o.type === "curve" || o.type === "poly") {
-      const n = G.nearestNode(o.pts, p);
-      if (n && n.d < near) return startNodeDrag(o, "pts", n.i);
-      const s = G.nearestSegment(o.pts, p, o.closed);
-      if (!s) return;
+    if ((o.type === "curve" || o.type === "poly") && o.pts) {
+      const seg = G.nearestSegment(o.pts, p, o.closed);
+      if (!seg || seg.i < 0) return null;
       snapshot();
-      o.pts.splice(s.i + 1, 0, { x: p.x, y: p.y });
-      drawVectors();
-      return startNodeDrag(o, "pts", s.i + 1);
+      o.pts.splice(seg.i + 1, 0, { x: p.x, y: p.y });
+      drawVectors(); save(); Sync.obj(o);
+      return { key: "pts", i: seg.i + 1 };
     }
-    if (o.type === "line" || o.type === "arrow") {
+    return null;
+  }
+
+  /* take a point out again — never below the two that make a shape */
+  function dropNode(o, i) {
+    if (!o || !o.pts || o.pts.length <= 2) return false;
+    if (!(i >= 0) || i >= o.pts.length) return false;
+    snapshot();
+    o.pts.splice(i, 1);
+    drawVectors(); save(); Sync.obj(o);
+    return true;
+  }
+
+  /* Reshaping: pull the point under the pointer, or make one right there and
+     pull that. One gesture covers both, so nothing has to be aimed at. */
+  function startBend(e, o) {
+    const p = toWorld(e.clientX, e.clientY);
+    const near = 18 / cam().z;
+    if (o.type === "link") {
+      const F = linkFrame(o);
+      if (F) {
+        let bi = -1, bd = Infinity;
+        F.mids.forEach((m, i) => { const d = G.dist(m, p); if (d < bd) { bd = d; bi = i; } });
+        if (bi >= 0 && bd < near) return startNodeDrag(o, "mid", bi);
+      }
+    } else if (o.pts) {
+      const n = G.nearestNode(o.pts, p);
+      if (n && n.i >= 0 && n.d < near) return startNodeDrag(o, "pts", n.i);
+    } else if (o.a && o.b) {
       const da = G.dist(o.a, p), db = G.dist(o.b, p);
       if (Math.min(da, db) < near) return startNodeDrag(o, "end", da < db ? "a" : "b");
-      return startDrag(e, o);
     }
-    return startDrag(e, o);
+    const made = addNodeAt(o, p);
+    /* A rectangle or an ellipse has corners instead of points: pressing it
+       carries the shape, which is the only sensible thing left to do. */
+    if (!made) return startDrag(e, o);
+    return startNodeDrag(o, made.key, made.i);
   }
 
   function dragCorner(e, o, cx, cy) {
@@ -3392,37 +3581,47 @@
     pointerSession({ move, up, grab: true });
   }
 
+  /* ------------------------------------------------------------------ *
+   * shapes: one press, one meaning
+   *
+   *   outline              select it, and carry it
+   *   point                move that point
+   *   Alt + outline        add a point there and pull it
+   *   Alt + point          take that point out
+   *   double click         add a point / take one out
+   *   corner of a box      resize it
+   *   ⌘ or Ctrl + outline  add it to the selection
+   *
+   * Ink is never drawn on top of ink. A press that lands on a shape edits
+   * that shape even with smart draw on, and a new stroke begins on empty
+   * board — which is the whole answer to "how do I move a shape without
+   * drawing a new one over it". Before, a shape had to be armed by a first
+   * press that did nothing, the second press yanked whichever point was
+   * nearest rather than moving the shape, and while drawing was on a press
+   * on a shape was ignored entirely. Now there is nothing to arm and
+   * nothing to remember: press to move, hold Alt to reshape.
+   * ------------------------------------------------------------------ */
   ink.addEventListener("pointerdown", (e) => {
-    /* A modifier suspends smart draw, so a press on a shape or one of its
-       points does what it would with drawing off: it moves the thing. */
-    const plain = e.ctrlKey || e.metaKey;
     if (e.button !== 0 || tidyMode) return;
-    if (drawMode && !plain) return;
     const t = e.target;
+
     if (t.classList.contains("node")) {
       /* preventDefault stops the browser starting its own drag of the SVG
          circle. Without it, grabbing a handle sometimes dragged a ghost
-         image of the dot instead of moving the node, and the real node
-         never followed the pointer. */
+         image of the dot instead of moving the node. */
       e.preventDefault();
       e.stopPropagation();
-      const g = t.closest("g") || {};
       const o = byId(selection);
       if (!o) return;
-      if (e.altKey && o.pts && o.pts.length > 2) {
-        snapshot();
-        o.pts.splice(+t.dataset.i, 1);
-        drawVectors(); save();
-        return;
-      }
+      if (e.altKey && t.dataset.i != null) { dropNode(o, +t.dataset.i); return; }
       if (t.dataset.barbs != null) return startNodeDrag(o, "barbStart", +t.dataset.barbs);
       if (t.dataset.barb != null) return startNodeDrag(o, "barb", +t.dataset.barb);
       if (t.dataset.i != null) return startNodeDrag(o, "pts", +t.dataset.i);
       if (t.dataset.end) return startNodeDrag(o, "end", t.dataset.end);
       if (t.dataset.m != null) return startNodeDrag(o, "mid", +t.dataset.m);
-      void g;
       return;
     }
+
     if (t.classList.contains("box")) {
       e.preventDefault();
       e.stopPropagation();
@@ -3430,25 +3629,41 @@
       if (o) dragCorner(e, o, +t.dataset.cx, +t.dataset.cy);
       return;
     }
+
     if (t.classList.contains("hit")) {
       e.preventDefault();
       e.stopPropagation();
       const id = t.parentNode.dataset.id;
       const o = byId(id);
       if (!o) return;
-      if (plain && !drawMode) { select(id, true); return; }
-      /* The first press on a shape only selects it, which is what puts its
-         nodes on screen. Nothing gets grabbed. Before, the press went
-         straight to the nearest node, so a plain click yanked whichever
-         point happened to be closest — frequently not the one you were
-         pointing at, and on a shape with no nodes drawn yet you could not
-         even see what you were about to hit. Once the dots are visible and
-         you can aim, the next press edits them. */
-      const armed = selection === id && selected.has(id);
-      if (!armed) { select(id); return startDrag(e, o); }
-      if (e.shiftKey) return startDrag(e, o);
-      startBend(e, o);
+      if (e.ctrlKey || e.metaKey) { select(id, true); return; }
+      /* Pressing a shape that is already part of a selection keeps that
+         selection, so a group travels together. */
+      if (!selected.has(id)) select(id);
+      if (e.altKey) return startBend(e, o);
+      return startDrag(e, o);
     }
+  });
+
+  /* Double click: a point appears where there was none, and goes away where
+     there was one. The same gesture in both directions. */
+  ink.addEventListener("dblclick", (e) => {
+    if (tidyMode) return;
+    const t = e.target;
+    if (t.classList.contains("node")) {
+      const o = byId(selection);
+      if (o && t.dataset.i != null) {
+        e.preventDefault(); e.stopPropagation();
+        dropNode(o, +t.dataset.i);
+      }
+      return;
+    }
+    if (!t.classList.contains("hit")) return;
+    const o = byId(t.parentNode.dataset.id);
+    if (!o) return;
+    e.preventDefault(); e.stopPropagation();
+    if (selection !== o.id) select(o.id);
+    addNodeAt(o, toWorld(e.clientX, e.clientY));
   });
 
   ink.addEventListener("contextmenu", (e) => {

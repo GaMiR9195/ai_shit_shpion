@@ -165,6 +165,74 @@ async function getFile(res, id) {
 }
 
 /* ------------------------------------------------------------------ *
+ * page fetcher
+ *
+ * Almost every site on the web forbids being put in a frame, with
+ * X-Frame-Options or a CSP frame-ancestors rule, and the browser answers
+ * with "refused to connect" no matter what the frame asks for. Those
+ * headers only bind the browser, so the page is fetched here instead and
+ * served from this origin without them. A <base> tag is slipped into the
+ * head so the page's own stylesheets, pictures and links still point at
+ * the site they came from.
+ *
+ * It stays a sandboxed frame on the client, and only http(s) documents
+ * under a size cap come through, so this is not a general purpose relay.
+ * ------------------------------------------------------------------ */
+const PROXY_MAX = 8 * 1024 * 1024;
+const PROXY_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+
+async function proxyPage(req, res, raw) {
+  if (typeof fetch !== "function") return send(res, 501, { error: "needs node 18+" });
+  let target;
+  try { target = new URL(String(raw || "")); } catch (e) { return send(res, 400, { error: "bad url" }); }
+  if (target.protocol !== "http:" && target.protocol !== "https:") return send(res, 400, { error: "bad url" });
+
+  let up;
+  try {
+    up = await fetch(target.href, {
+      redirect: "follow",
+      headers: {
+        // asking as a browser would: a bare fetch gets a wall from many sites
+        "user-agent": PROXY_UA,
+        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "accept-language": String(req.headers["accept-language"] || "en"),
+      },
+    });
+  } catch (e) {
+    return send(res, 502, { error: "could not reach that page" });
+  }
+
+  const type = up.headers.get("content-type") || "application/octet-stream";
+  let buf;
+  try { buf = Buffer.from(await up.arrayBuffer()); }
+  catch (e) { return send(res, 502, { error: "could not read that page" }); }
+  if (buf.length > PROXY_MAX) return send(res, 502, { error: "page too large" });
+
+  const code = up.status >= 200 && up.status < 400 ? up.status : 200;
+
+  // anything that is not a document is passed straight back through
+  if (!/^text\/html|^application\/xhtml/i.test(type)) {
+    res.writeHead(code, { "content-type": type, "cache-control": "public, max-age=300" });
+    return void res.end(buf);
+  }
+
+  let html = buf.toString("utf8");
+  const base = '<base href="' + up.url.replace(/"/g, "&quot;") + '">';
+  // drop the page's own framing rules, then anchor its relative links
+  html = html.replace(/<meta[^>]+http-equiv=["\']?content-security-policy["\']?[^>]*>/gi, "");
+  html = /<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, (m) => m + base) : base + html;
+
+  res.writeHead(code, {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+    "referrer-policy": "no-referrer",
+  });
+  res.end(html);
+}
+
+/* ------------------------------------------------------------------ *
  * request router
  * ------------------------------------------------------------------ */
 const server = http.createServer(async (req, res) => {
@@ -173,6 +241,10 @@ const server = http.createServer(async (req, res) => {
   try {
     if (url === "/api/health") {
       return send(res, 200, { ok: true, pretext: !!vendorEntry, rooms: rooms.size });
+    }
+    if (url.startsWith("/api/proxy") && (req.method === "GET" || req.method === "HEAD")) {
+      const q = new URL(url, "http://board.local").searchParams.get("url");
+      return void (await proxyPage(req, res, q));
     }
     if (url === "/api/files" && req.method === "POST") return void (await putFile(req, res));
     if (url.startsWith("/api/files/") && req.method === "GET") {

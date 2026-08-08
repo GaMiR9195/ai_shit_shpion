@@ -428,7 +428,24 @@
       if (solid) return solid;
     }
 
-    const closed = chord < Math.max(18, diag * 0.22) && L > diag * 1.9;
+    /* The micro threshold for closing a figure.
+
+       A hand almost never lands back on the point it started from, so an
+       outline that stops a little short of itself is welded shut: the gap
+       between the two ends is under a small absolute distance or a fifth of
+       the figure's own size, and the pen went round far enough — by length
+       and by total turning — to have drawn an outline at all. The old rule
+       wanted the ends nearly touching and the stroke almost twice the
+       diagonal, which is why circles and boxes so often came out as open
+       squiggles. The second, tighter rule below catches a freehand loop
+       that is not any named shape.
+
+       Turning is what keeps this honest: a long straight zigzag can end up
+       near its own start, but it never accumulates a full turn. */
+    const CLOSE_ABS = 26;
+    const gapClose = chord < Math.max(CLOSE_ABS, diag * 0.3);
+    const gapMicro = chord < Math.max(14, Math.min(diag * 0.16, L * 0.07));
+    const closed = gapClose && L > diag * 1.35 && turn.signed > Math.PI * 1.1;
 
     if (!closed) {
       if (!o.noArrow) {
@@ -449,6 +466,9 @@
         const solid = silhouetteArrow(ink, hullPts, diag);
         if (solid) return solid;
       }
+      /* Not a shape with a name, but the pen came back to where it began:
+         a closed freehand outline rather than an open ribbon. */
+      if (gapMicro && L > diag * 1.1) return { kind: "curve", pts: autoNodes(raw, true), closed: true };
       return { kind: "curve", pts: autoNodes(raw, false), closed: false };
     }
 

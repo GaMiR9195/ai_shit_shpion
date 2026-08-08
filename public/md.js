@@ -155,8 +155,20 @@
         out.push('<pre><code data-lang="' + esc(lang) + '">' + hi(buf.join("\n"), lang) + "</code></pre>");
         continue;
       }
-      const h = ln.match(/^(#{1,6})\s+(.*)$/);
-      if (h) { closeList(); out.push("<h" + h[1].length + ">" + inline(h[2]) + "</h" + h[1].length + ">"); i++; continue; }
+      /* `# Title`, `#Title` and `## Title ##` are all one heading. A hand
+         that forgot the space still meant a heading — that missing space
+         was why typing one did nothing — and a closing run of hashes is
+         decoration, not text. `#include`, `#!/bin/sh` and `#fff` stay put:
+         those are code that happens to start with a hash. */
+      const h = ln.match(/^[ \t]{0,3}(#{1,6})([ \t]*)(.*)$/);
+      const heading = h && h[3].trim() && (h[2] ||
+        !/^(?:include|define|ifdef|ifndef|endif|elif|else|if|pragma|undef|import|!|[0-9a-fA-F]{3,8}$)/.test(h[3]));
+      if (heading) {
+        closeList();
+        const txt = h[3].replace(/[ \t]+#+[ \t]*$/, "").trim();
+        out.push("<h" + h[1].length + ">" + inline(txt) + "</h" + h[1].length + ">");
+        i++; continue;
+      }
       if (/^\s*([-*_])\1{2,}\s*$/.test(ln)) { closeList(); out.push("<hr>"); i++; continue; }
       const q = ln.match(/^\s*>\s?(.*)$/);
       if (q) { closeList(); out.push("<blockquote>" + inline(q[1]) + "</blockquote>"); i++; continue; }
@@ -175,7 +187,11 @@
       closeList();
       const para = [ln];
       i++;
-      while (i < lines.length && lines[i].trim() && !/^\s*(#{1,6}\s|```|>|[-*+]\s|\d+[.)]\s)/.test(lines[i])) para.push(lines[i++]);
+      /* A block that starts on the next line ends this paragraph. A heading
+         written straight under a line of prose used to be swallowed into it,
+         because this test wanted a space after the hashes. */
+      const opens = /^\s*(?:#{1,6}|```|~~~|>|[-*+]\s|\d+[.)]\s|(?:[-*_]\s*){3,}$|\|)/;
+      while (i < lines.length && lines[i].trim() && !opens.test(lines[i])) para.push(lines[i++]);
       out.push("<p>" + inline(para.join("\n")).replace(/\n/g, "<br>") + "</p>");
     }
     closeList();
