@@ -1,0 +1,429 @@
+:root{
+  --bg:#121212;
+  --grid:rgba(255,255,255,.035);
+  --grid-major:rgba(255,255,255,.062);
+  --surface:#1a1a1a;
+  --surface-2:#202020;
+  --raised:#282828;
+  --line:rgba(255,255,255,.14);
+  --line-soft:rgba(255,255,255,.08);
+  --ink:#e9e7e4;
+  --ink-2:rgba(233,231,228,.56);
+  --ink-3:rgba(233,231,228,.34);
+  --sel:#e9e7e4;
+  --hot:#c2703f;
+  --r:10px;
+  --pad:14px;
+  --grab:14px;            /* resize band width. Was 8, too fine to hit. */
+  --ease:cubic-bezier(.22,.9,.24,1);
+  --fast:cubic-bezier(.16,.84,.24,1);
+  --mono:"Menlo","Consolas","SF Mono",ui-monospace,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;overflow:hidden;background:var(--bg);color:var(--ink);
+  font-family:var(--sans);font-size:14px;line-height:1.5;
+  -webkit-font-smoothing:antialiased;text-rendering:geometricPrecision}
+/* no scrollbars anywhere — content still scrolls with the wheel */
+*{scrollbar-width:none;-ms-overflow-style:none}
+*::-webkit-scrollbar{width:0;height:0;display:none}
+
+/* No focus rings, no tap flashes, no dotted Firefox inner border. The
+   board is a canvas, not a form: a box appearing around a thing you just
+   clicked is exactly the look this is trying to avoid. Keyboard users
+   still get the caret and the .sel border. */
+:focus,:focus-visible{outline:0}
+::-moz-focus-inner{border:0}
+button,select,textarea,input,[contenteditable]{-webkit-tap-highlight-color:transparent}
+
+#app{position:fixed;inset:0;overflow:hidden;cursor:default}
+#app.panning{cursor:grabbing}
+#app.draw,#app.tidy{cursor:crosshair}
+/* holding a modifier suspends smart draw, so the cursor says so */
+#app.draw.bypass{cursor:default}
+
+/* ---------- drag shield ----------
+   While a card is being carried or resized, one transparent sheet takes
+   every pointer event. A video's controls and an embedded page live in
+   their own event world and used to eat the release, which left the card
+   stuck to the cursor. Belt and braces: contents also stop taking events,
+   so a press that starts on a card cannot be stolen mid-drag either. */
+#shield{position:absolute;inset:0;z-index:80;display:none;cursor:inherit}
+#app.dragging{cursor:grabbing}
+#app.dragging #shield{display:block}
+#app.dragging .obj *{pointer-events:none!important}
+
+/* ---------- background grid ---------- */
+#grid{position:absolute;inset:0;pointer-events:none;
+  background-color:var(--bg);
+  background-image:
+    linear-gradient(to right,var(--grid-major) 1px,transparent 1px),
+    linear-gradient(to bottom,var(--grid-major) 1px,transparent 1px),
+    linear-gradient(to right,var(--grid) 1px,transparent 1px),
+    linear-gradient(to bottom,var(--grid) 1px,transparent 1px);
+}
+
+/* cluster field. Screen space, under everything, never interactive.
+   Replaces the old SVG threshold filter, which is what made the pools
+   look like stacked circles with a hard rim. */
+#field{position:absolute;inset:0;pointer-events:none;z-index:0}
+
+/* world is not promoted to its own layer: text is rasterised at the real
+   scale, so glyphs stay sharp like vector art instead of being resampled */
+#world{position:absolute;left:0;top:0;width:0;height:0;transform-origin:0 0;z-index:1}
+#ink{position:absolute;left:0;top:0;width:1px;height:1px;overflow:visible;pointer-events:none}
+#ink *{pointer-events:none}
+#ink path.hit,#ink .node,#ink .box{pointer-events:auto}
+#layer{position:absolute;left:0;top:0;width:0;height:0}
+#scratch{position:absolute;inset:0;pointer-events:none;z-index:2}
+
+/* ---------- other people ---------- */
+#cursors{position:absolute;inset:0;pointer-events:none;z-index:55;overflow:hidden}
+.peer{position:absolute;left:0;top:0;width:20px;height:20px;
+  will-change:transform;transition:transform .07s linear}
+.peer svg{display:block;overflow:visible}
+/* one flat colour plus a dark outline so it reads on any card */
+.peer svg path{fill:var(--peer);stroke:rgba(0,0,0,.75);stroke-width:1.4;stroke-linejoin:round}
+.peer.drag svg path{fill:var(--peer);stroke:rgba(255,255,255,.85)}
+
+/* ---------- objects ---------- */
+/* one flat card. No hover state, no click flash, no resize gizmo:
+   the only feedback is a faint border when selected and a small lift
+   while it is being carried. */
+.obj{position:absolute;left:0;top:0;transform-origin:50% 50%;
+  background:var(--surface);border:1px solid var(--line);border-radius:var(--r);
+  box-shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.28);
+  display:flex;flex-direction:column;contain:layout paint}
+/* the selection border is one of the board's own colours — the paper
+   white, --ink — rather than a dim grey that was hard to pick out */
+.obj.sel{border-color:rgba(233,231,228,.6)}
+.obj.ghost{opacity:.45}
+/* a card scrolled off screen keeps its box but stops painting */
+.obj.off{content-visibility:hidden}
+.obj .inner{padding:var(--pad);flex:1;min-height:0;display:flex;flex-direction:column;
+  border-radius:inherit;overflow:hidden}
+/* soft outline for a card someone else is holding */
+.obj[data-held]{box-shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.28),
+  0 0 0 1.5px var(--held,transparent)}
+
+/* floating tool rail — only visible on focus / selection */
+.rail{position:absolute;left:0;top:0;transform:translateY(-100%) translateY(-7px);
+  display:flex;gap:3px;align-items:center;padding:3px;
+  background:var(--raised);border:1px solid var(--line);border-radius:8px;
+  opacity:0;pointer-events:none;translate:0 3px;
+  transition:opacity .14s var(--ease),translate .14s var(--ease);z-index:6;white-space:nowrap}
+.obj.sel>.rail,.obj.focus>.rail,.rail:hover{opacity:1;pointer-events:auto;translate:0 0}
+.rail button,.rail .seg{
+  appearance:none;background:transparent;border:0;color:var(--ink-2);
+  font:500 11px/1 var(--sans);letter-spacing:.02em;
+  padding:5px 7px;border-radius:5px;cursor:pointer;
+  transition:background .12s var(--ease),color .12s var(--ease)}
+.rail button:hover{background:rgba(255,255,255,.08);color:var(--ink)}
+.rail button.on{background:rgba(255,255,255,.14);color:var(--ink)}
+.rail .div{width:1px;height:14px;background:var(--line-soft);margin:0 2px}
+
+/* language tag. A button, and when you click it, a caret. No dropdown,
+   no arrow, no popup, no background swap — you type `py` over the top of
+   the old value, same as a fence in chat. Four to five characters is the
+   whole vocabulary, so a menu was never the right control. */
+.rail .lang{font:500 11px/1 var(--mono);letter-spacing:.06em;color:var(--ink-2);
+  min-width:26px;text-align:center;padding:5px 6px;border-radius:5px;
+  background:transparent;border:0;cursor:text;caret-color:var(--ink);
+  white-space:pre;overflow:hidden}
+.rail .lang:hover{color:var(--ink)}
+.rail .lang:focus{background:transparent;color:var(--ink)}
+.rail .lang.bad{color:var(--hot)}
+
+/* note — text, and nothing but. No name row, no placeholder glyphs:
+   an empty note is empty. */
+.note .body{font-size:13px;color:rgba(233,231,228,.82);outline:0;flex:1;overflow:auto;white-space:pre-wrap;word-break:break-word}
+.note .body ul{margin:4px 0;padding-left:18px}
+
+/* ---------- sketch ----------
+   The canvas is taken out of flow entirely. Previously it was a flex
+   child whose width/height attributes are also its intrinsic size, so
+   every redraw fed back into layout: resize the card and the drawing
+   crept downward on every frame you held the mouse. Now the pad is a
+   positioned box and the canvas is pinned to its inset, which means the
+   canvas cannot influence the card's size no matter what it is set to. */
+.sketch .inner{padding:0;gap:0;position:relative}
+/* The pad is the whole card. The ink strip used to sit below it in flow
+   and take a 23px bite out of the bottom of the paper — a dead band you
+   could not draw on and could not see. Now the strip floats over the pad,
+   so every pixel of the card is drawable. */
+.sketch .pad{position:absolute;inset:0;border-radius:inherit;overflow:hidden}
+.sketch canvas{position:absolute;inset:0;width:100%;height:100%;display:block;
+  touch-action:none;cursor:crosshair;background:transparent}
+/* ink strip: ten colours, three nibs, eraser. It is not there at all until
+   the pointer is over the card, rather than sitting greyed out on top of
+   the paper you are trying to draw on. */
+/* The strip is a fixed 30px band with the same air above the row as
+   below it, and it takes pointer events whether or not it is faded in.
+   That makes it one honest no-draw zone: a stroke started down here would
+   have been drawn under controls you cannot see. */
+.sketch .pal{position:absolute;left:0;right:0;bottom:0;z-index:2;height:30px;
+  display:flex;align-items:center;gap:5px;
+  padding:9px var(--pad);opacity:0;transition:opacity .13s var(--fast);
+  pointer-events:auto;cursor:default}
+.sketch:hover .pal{opacity:1}
+/* flex:0 0 auto — a squeezed row was flattening the dots into ovals */
+.sketch .pal button{appearance:none;border:0;padding:0;background:transparent;cursor:pointer;
+  flex:0 0 auto;display:flex;align-items:center;justify-content:center;pointer-events:auto}
+.sketch .pal .sd{width:11px;height:11px;border-radius:50%;
+  transition:transform .14s var(--fast)}
+.sketch .pal .sd.on{transform:scale(1.3)}
+.sketch .pal .gap{flex:0 0 auto;width:1px;height:11px;background:var(--line-soft);margin:0 2px}
+/* the eraser is a circle of nothing: a 2×2 checker, the standing mark for
+   transparency, so it needs no caption sitting among the colour dots */
+.sketch .pal .er{width:11px;height:11px;border-radius:50%;
+  background:conic-gradient(#0d0d0d 0 25%,#8f8f8f 0 50%,#0d0d0d 0 75%,#8f8f8f 0);
+  transition:transform .14s var(--fast)}
+.sketch .pal .er.on{transform:scale(1.3)}
+/* three nibs: small, medium, large. The largest is exactly a colour dot,
+   so the whole strip reads as one row of same-sized controls. */
+.sketch .pal .nib{width:11px;height:11px;border-radius:50%}
+.sketch .pal .nib::before{content:"";width:var(--nib,4px);height:var(--nib,4px);border-radius:50%;
+  background:var(--ink-3);transition:background .14s var(--fast)}
+.sketch .pal .nib.on::before{background:var(--ink)}
+
+/* a number you can type over: plain text, same size and baseline as the
+   words beside it, no plate behind it and nothing on focus */
+.num{font:12.5px/1.35 var(--sans);color:var(--ink);min-width:8px;
+  display:inline;outline:0;cursor:text;caret-color:var(--ink);background:transparent}
+
+/* ---------- code ---------- */
+.code{background:#151515}
+/* double-click the name to rename. No pencil, no modal, no field. */
+.code .fname,.file .fn{cursor:default}
+.code .fname[contenteditable="true"],.file .fn[contenteditable="true"]{
+  cursor:text;caret-color:var(--ink);color:var(--ink);background:transparent;outline:0;
+  white-space:pre;overflow:visible;text-overflow:clip}
+.code .fname{font:500 10.5px/1 var(--mono);color:var(--ink-3);letter-spacing:.03em;
+  margin-bottom:8px;flex:0 0 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* The editor is a transparent textarea sitting exactly on top of a
+   highlighted <pre>. Both use the identical font metrics, padding and
+   wrapping, so the coloured text you see is the text your caret is in.
+   The textarea keeps native editing: selection, undo, IME, spellcheck off. */
+.code .pad{position:relative;flex:1;min-height:0;display:flex;overflow:hidden}
+.code .hlbg,.code textarea{
+  margin:0;padding:0;border:0;
+  font:12.5px/1.6 var(--mono);tab-size:2;
+  white-space:pre;word-break:normal;overflow-wrap:normal;
+  letter-spacing:0}
+.code .hlbg{position:absolute;inset:0;overflow:auto;pointer-events:none;
+  color:#dcd9d4;background:transparent}
+.code textarea{position:relative;flex:1;width:100%;resize:none;outline:0;
+  background:transparent;color:transparent;caret-color:#e9e7e4;overflow:auto;z-index:1}
+.code textarea::selection{background:rgba(233,231,228,.22);color:transparent}
+.code textarea::placeholder{color:var(--ink-3)}
+
+.code .view{flex:1;overflow:auto;padding:0;font-size:13px;color:rgba(233,231,228,.86)}
+.code .view>:first-child{margin-top:0}
+.code .view h1,.code .view h2,.code .view h3{font-size:14px;margin:10px 0 4px;letter-spacing:.01em}
+.code .view h1{font-size:16px}
+.code .view p{margin:6px 0}
+.code .view ul,.code .view ol{margin:6px 0;padding-left:18px}
+.code .view code{font-family:var(--mono);font-size:12px;background:rgba(255,255,255,.07);padding:1px 4px;border-radius:4px}
+.code .view pre{background:#101010;border:1px solid var(--line-soft);border-radius:8px;padding:9px 11px;overflow:auto}
+.code .view pre code{background:0;padding:0}
+.code .view a{color:#a8b6c4}
+.code .view blockquote{margin:6px 0;padding-left:10px;border-left:2px solid var(--line);color:var(--ink-2)}
+.code .view hr{border:0;border-top:1px solid var(--line-soft);margin:10px 0}
+
+/* token palette — muted, same family as the board */
+.tok-k{color:#c98f5e}                      /* keyword */
+.tok-s{color:#9aab84}                      /* string */
+.tok-r{color:#8a9a5b}                      /* regex */
+.tok-c{color:#5f5f5f;font-style:italic}    /* comment */
+.tok-n{color:#9b8fb5}                      /* number */
+.tok-l{color:#a8626b}                      /* literal: true, nil, None */
+.tok-f{color:#8fa9c4}                      /* call */
+.tok-t{color:#6f9a8d}                      /* type */
+.tok-m{color:#b58b4c}                      /* preprocessor */
+.tok-p{color:rgba(233,231,228,.45)}        /* punctuation */
+
+/* media */
+.media{background:#0f0f0f}
+.media .inner{padding:0}
+.media img,.media video{width:100%;height:100%;object-fit:contain;display:block;background:#0f0f0f;user-select:none;-webkit-user-drag:none}
+.media.cover img,.media.cover video{object-fit:cover}
+.media iframe{width:100%;height:100%;border:0;display:block;background:#000}
+/* An unselected clip is a picture you can pick up: pressing anywhere on
+   it grabs the card. Previously the player swallowed the press, so a
+   video was the one card on the board you could not drag by its middle.
+   Select it and the controls come alive. */
+.media video,.media iframe{pointer-events:none}
+.media.sel video,.media.sel iframe{pointer-events:auto}
+.media .empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  color:var(--ink-3);font-size:12px;letter-spacing:.04em}
+
+/* file card — line icon, no plate behind it */
+.file .inner{align-items:center;justify-content:center;gap:10px;text-align:center;padding:16px}
+.file svg{width:34px;height:34px;flex:0 0 auto;stroke:rgba(233,231,228,.66);fill:none;
+  stroke-width:1.3;stroke-linecap:round;stroke-linejoin:round}
+.file .fn{font:500 12px/1.35 var(--sans);color:rgba(233,231,228,.86);
+  max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file .meta{font:500 10px/1 var(--mono);letter-spacing:.09em;color:var(--ink-3);text-transform:uppercase}
+.file .meta .up{color:var(--hot)}
+
+/* ---------- file space ----------
+   A flat shelf: no folders, no parents, no breadcrumb. Rows are wider and
+   shorter than a lone file card, and the card's height is exactly the
+   rows it holds, so adding a file lengthens it by one row and no more. */
+.shelf .inner{padding:8px;gap:6px;overflow:hidden;justify-content:flex-start}
+.shelf .row{flex:0 0 auto;height:30px;display:flex;align-items:center;gap:8px;
+  padding:0 9px;border-radius:6px;background:var(--surface-2);
+  transition:background .12s var(--ease)}
+.shelf .row:hover{background:var(--raised)}
+.shelf .row.lift{background:var(--raised);box-shadow:0 6px 16px rgba(0,0,0,.45)}
+.shelf .row svg{width:15px;height:15px;flex:0 0 auto;stroke:rgba(233,231,228,.6);fill:none;
+  stroke-width:1.3;stroke-linecap:round;stroke-linejoin:round}
+.shelf .row .fn{flex:1;min-width:0;font:500 12px/1 var(--sans);color:rgba(233,231,228,.86);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.shelf .row .meta{flex:0 0 auto;font:500 10px/1 var(--mono);letter-spacing:.07em;
+  color:var(--ink-3);text-transform:uppercase}
+.shelf .row .fn[contenteditable="true"]{cursor:text;caret-color:var(--ink);color:var(--ink);
+  overflow:visible;text-overflow:clip}
+
+/* ---------- page ----------
+   Off, it is a card with an address on it. On, the page is live and you
+   use it. Nothing else changes between the two states. */
+.web{background:#0f0f0f}
+.web .inner{padding:0;position:relative}
+.web iframe{width:100%;height:100%;border:0;display:block;background:#fff;border-radius:inherit}
+.web .card{flex:1;display:flex;flex-direction:column;justify-content:center;gap:9px;padding:16px}
+.web .card svg{width:26px;height:26px;flex:0 0 auto;stroke:rgba(233,231,228,.6);fill:none;
+  stroke-width:1.3;stroke-linecap:round;stroke-linejoin:round}
+.web .card .fn{font:500 12.5px/1.35 var(--sans);color:rgba(233,231,228,.86);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.web .card .addr{font:500 10.5px/1.4 var(--mono);color:var(--ink-3);
+  word-break:break-all;max-height:2.8em;overflow:hidden}
+/* same rule as a clip: dead until selected, so the card stays draggable */
+.web iframe{pointer-events:none}
+.web.sel iframe{pointer-events:auto}
+
+/* ---------- maths ----------
+   KaTeX ships its own metrics; all that is needed here is the room around
+   a display block and a readable fallback when it could not load. */
+.tex-block{margin:8px 0;overflow-x:auto;overflow-y:hidden}
+.tex-block:first-child{margin-top:0}
+.tex-raw,.tex-bad{font-family:var(--mono);font-size:12px;color:var(--ink-2)}
+.tex-bad{color:var(--hot)}
+
+/* ---------- context menu ---------- */
+.menu{position:absolute;z-index:60;min-width:176px;max-width:264px;padding:4px;
+  background:rgba(26,26,26,.98);border:1px solid var(--line);border-radius:9px;
+  box-shadow:0 12px 34px rgba(0,0,0,.6),0 0 0 1px rgba(0,0,0,.35);
+  backdrop-filter:blur(7px);
+  animation:pop .13s var(--ease) both}
+@keyframes pop{from{opacity:0;transform:translateY(-3px) scale(.985)}to{opacity:1;transform:none}}
+/* "Outline: 1" and "Link: https://…" read as single phrases, so the rows
+   are laid out as single phrases: flush left, value right after the
+   colon. Pinning the value to the right edge turned the menu into a
+   settings table. */
+.menu .it{display:flex;align-items:center;justify-content:flex-start;gap:5px;
+  padding:6px 9px;border-radius:6px;font:12.5px/1.35 var(--sans);color:rgba(233,231,228,.86);cursor:default;
+  transition:background .1s var(--ease),color .1s var(--ease)}
+.menu .it .val{flex:1;min-width:0;max-width:168px;font:12.5px/1.35 var(--sans);color:var(--ink);
+  outline:0;caret-color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:clip;
+  direction:ltr;background:transparent}
+.menu .it .val:empty::before{content:"—";color:var(--ink-3)}
+.menu .it:hover,.menu .it.hi{background:rgba(255,255,255,.09);color:var(--ink)}
+.menu .it.hot{color:var(--hot)}
+.menu .it .k{font:500 10.5px/1 var(--mono);color:var(--ink-3);letter-spacing:.04em}
+.menu .sep{height:1px;margin:4px 6px;background:var(--line-soft)}
+.menu .lab{padding:5px 9px 3px;font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-3)}
+.menu .inp{display:flex;gap:5px;padding:3px 5px 5px}
+.menu .inp input{flex:1;min-width:0;background:#101010;border:1px solid var(--line);border-radius:6px;
+  color:var(--ink);font:12px var(--sans);padding:5px 7px;outline:0}
+.menu .inp input:focus{border-color:rgba(255,255,255,.34)}
+.menu .inp button{background:rgba(255,255,255,.1);border:0;border-radius:6px;color:var(--ink);
+  font:500 11.5px var(--sans);padding:0 9px;cursor:pointer}
+.menu .inp button:hover{background:rgba(255,255,255,.18)}
+/* five and five, stacked. It was a wrapping flex row sized so that nine
+   dots fitted and the tenth fell onto its own line. */
+.menu .sw{display:grid;grid-template-columns:repeat(5,13px);gap:6px;
+  padding:4px 9px 7px;justify-content:start}
+.menu .sw .dot{width:13px;height:13px;border-radius:50%;box-shadow:0 0 0 1px rgba(0,0,0,.5);cursor:pointer;
+  transition:transform .13s var(--ease),box-shadow .13s var(--ease)}
+.menu .sw .dot.on{transform:scale(1.22);box-shadow:0 0 0 1.5px rgba(233,231,228,.9)}
+/* inline number: the row's value turns into a caret when you click it */
+.menu .it .num{font:12.5px/1.35 var(--sans);color:var(--ink);min-width:8px;height:auto;padding:0}
+
+/* ---------- status ---------- */
+.mode{position:absolute;left:14px;bottom:12px;z-index:40;
+  font:500 11px/1 var(--sans);letter-spacing:.06em;color:var(--hot);
+  padding:6px 9px;border:1px solid rgba(194,112,63,.35);border-radius:7px;background:rgba(194,112,63,.09);
+  animation:pop .16s var(--ease) both}
+.hint{display:none}
+.toast{position:absolute;left:50%;bottom:22px;transform:translateX(-50%);z-index:70;
+  font:12px var(--sans);color:var(--ink-2);padding:7px 12px;border-radius:8px;
+  background:rgba(30,30,30,.97);border:1px solid var(--line);box-shadow:0 8px 26px rgba(0,0,0,.5);
+  animation:pop .14s var(--ease) both}
+
+/* marquee select */
+.marq{position:absolute;z-index:45;pointer-events:none;
+  border:1px solid rgba(233,231,228,.4);background:rgba(233,231,228,.05);border-radius:3px}
+
+/* Anchor dot for connectors. It sits centred on the border stripe and
+   rides along it, and it is the same dot you get once the connector
+   exists — dark fill, white ring, 11px across, matching #ink .node. It
+   used to be a solid white bead with a glow around it, floating clear of
+   the card. */
+.anchor{position:absolute;left:0;top:0;width:11px;height:11px;margin:-5.5px 0 0 -5.5px;
+  box-sizing:border-box;border-radius:50%;
+  background:#151515;border:1.4px solid #fff;
+  pointer-events:none;z-index:50;opacity:0;
+  transition:transform .1s var(--fast),opacity .1s linear}
+.anchor.on{opacity:1}
+
+/* vector ink — stroke colour is set inline so a picked colour always wins */
+#ink path.hit{stroke:transparent;fill:none;stroke-width:22;cursor:pointer}
+#ink .shape{fill:none;stroke:#d8d5d0;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+#ink .fillable{fill:rgba(255,255,255,.022)}
+/* handles must never become a drag image: the browser was picking the
+   node up as a picture instead of letting the pointer handler run */
+#ink .node,#ink .box{-webkit-user-drag:none;user-select:none;touch-action:none}
+/* No r here on purpose. The radius is set per node in script so a handle
+   is the same size on screen at any zoom; a value in this file is a
+   presentation rule and silently won that fight, which is why handles
+   used to swell as you zoomed in. */
+#ink .node{fill:#151515;stroke:#fff;stroke-width:1.4;cursor:grab;
+  transform-box:fill-box;transform-origin:center}
+#ink .node.mid{stroke:rgba(255,255,255,.45);fill:rgba(21,21,21,.7)}
+/* the two barbs of an arrow head, shaped like the head they move */
+#ink .node.barb{fill:rgba(21,21,21,.7);stroke:rgba(255,255,255,.6)}
+/* joining or splitting a seam: the dot swells by a pixel and settles.
+   That is the whole acknowledgement — no flash, no ring, no colour. */
+#ink .node.tick{animation:tick .28s var(--fast)}
+@keyframes tick{0%{transform:scale(1)}40%{transform:scale(1.34)}100%{transform:scale(1)}}
+#ink .box{fill:#fff;stroke:#111;stroke-width:1;cursor:nwse-resize}
+
+/* nothing on the board should be draggable as a browser image */
+.obj,.obj *,#ink,#ink *{-webkit-user-drag:none}
+.obj .title,.obj .body,.obj textarea,.obj [contenteditable="true"]{-webkit-user-drag:auto}
+
+@media (prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+
+/* ------------------------------------------------------------------ *
+ * highlight.js tokens, mapped onto the board palette
+ * ------------------------------------------------------------------ */
+.hljs-keyword,.hljs-selector-tag{color:#c98f5e}
+.hljs-string,.hljs-meta .hljs-string{color:#9aab84}
+.hljs-regexp{color:#8a9a5b}
+.hljs-comment,.hljs-quote{color:#5f5f5f;font-style:italic}
+.hljs-number{color:#9b8fb5}
+.hljs-literal,.hljs-built_in{color:#a8626b}
+.hljs-title,.hljs-title.function_,.hljs-section{color:#8fa9c4}
+.hljs-type,.hljs-title.class_,.hljs-class .hljs-title{color:#6f9a8d}
+.hljs-meta,.hljs-meta-keyword{color:#b58b4c}
+.hljs-punctuation,.hljs-operator{color:rgba(233,231,228,.45)}
+.hljs-attr,.hljs-attribute,.hljs-property{color:#8fa9c4}
+.hljs-variable,.hljs-template-variable,.hljs-params{color:#e9e7e4}
+.hljs-symbol,.hljs-bullet{color:#b58b4c}
+.hljs-name,.hljs-selector-id,.hljs-selector-class{color:#c98f5e}
+.hljs-deletion{color:#a8626b}
+.hljs-addition{color:#8a9a5b}
+.hljs-emphasis{font-style:italic}
+.hljs-strong{font-weight:600}

@@ -1,0 +1,19 @@
+{
+  "name": "space-board",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Infinite board — local-first, with a small Railway server for shared files and live presence.",
+  "engines": {
+    "node": ">=20.6"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "bundle": "node tools/bundle.js"
+  },
+  "dependencies": {
+    "@chenglou/pretext": "0.0.8",
+    "ws": "^8.18.0"
+  }
+}
