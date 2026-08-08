@@ -71,6 +71,8 @@
       retry = 0;
       alive = true;
       status("online");
+      // anything queued while the room was down goes out now
+      if (outbox.size) flush(true);
     };
 
     ws.onmessage = (ev) => {
@@ -116,10 +118,11 @@
     el.className = "peer";
     el.style.setProperty("--peer", color || "#888");
     el.innerHTML =
-      '<svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true">' +
+      '<svg width="26" height="26" viewBox="0 0 20 20" aria-hidden="true">' +
       '<path d="M3 2l12 6.2-5.1 1.3-1.6 5z"/></svg>';
     if (layer) layer.appendChild(el);
-    peers.set(id, { color, el, x: 0, y: 0, drag: false, seen: performance.now() });
+    // x,y is where they say they are; cx,cy is where their pointer is drawn
+    peers.set(id, { color, el, x: 0, y: 0, cx: 0, cy: 0, live: false, drag: false, seen: performance.now() });
   }
 
   function dropPeer(id) {
@@ -134,17 +137,26 @@
     const p = peers.get(m.id);
     if (!p) return;
     p.x = m.x; p.y = m.y; p.drag = !!m.drag;
+    if (!p.live) { p.live = true; p.cx = m.x; p.cy = m.y; }
     p.seen = performance.now();
   }
 
-  /* peers are stored in world coords, so they stay glued to the board
-     while you pan and zoom. Called from the board's own frame loop. */
+  /* Peers are stored in world coords, so they stay glued to the board while
+     you pan and zoom, and the projection is redone every frame: panning
+     carries their pointer along with the board exactly, with nothing
+     trailing behind. The only smoothing is on their own motion — packets
+     arrive 40ms apart — and it is done here rather than as a CSS transition,
+     which used to smear their pointer across the screen every time the board
+     moved underneath it. Called from the board's frame loop. */
   function paint(toScreen) {
     if (!peers.size || !toScreen) return;
     for (const [, p] of peers) {
-      const s = toScreen(p.x, p.y);
+      const dx = p.x - p.cx, dy = p.y - p.cy;
+      // a jump this far is a new position, not motion: land on it
+      if (Math.abs(dx) + Math.abs(dy) > 1200) { p.cx = p.x; p.cy = p.y; }
+      else { p.cx += dx * 0.4; p.cy += dy * 0.4; }
+      const s = toScreen(p.cx, p.cy);
       p.el.style.transform = "translate3d(" + s.x + "px," + s.y + "px,0)";
-      p.el.classList.toggle("drag", p.drag);
     }
   }
 
@@ -186,16 +198,27 @@
 
   const remove = (id) => push(id, { _: 1 }, true);
 
+  let flushT = 0;
   function flush(force) {
     const now = performance.now();
-    if (!force && now - flushAt < OP_MS) return;
+    if (!force && now - flushAt < OP_MS) {
+      /* A change that landed inside the window used to sit in the outbox
+         with nothing left to send it: one edit, then silence, and the other
+         windows never heard about it at all. Whatever is held back now
+         leaves on a timer. */
+      if (!flushT) flushT = setTimeout(() => { flushT = 0; flush(true); }, OP_MS);
+      return;
+    }
+    if (flushT) { clearTimeout(flushT); flushT = 0; }
     flushAt = now;
 
     if (cursorPending) { send(cursorPending); cursorPending = null; cursorAt = now; }
     if (!outbox.size) return;
 
     const ops = [...outbox.values()];
+    // a closed socket keeps the queue: it goes out when the room is back
     if (send({ type: "ops", ops })) outbox = new Map();
+    else if (!flushT) flushT = setTimeout(() => { flushT = 0; flush(true); }, 600);
   }
 
   /* apply an incoming op to a local object, honouring the clock */

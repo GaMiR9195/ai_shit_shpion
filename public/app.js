@@ -32,38 +32,101 @@
   const Sync = {
     on: false,
 
-    // called after every local commit; the doc is already saved by now
-    push(d) { void d; if (Sync.on) Net.flush(); },
+    /* Everything this window has already told the room, field by field, as
+       JSON. Every change goes out through this one diff, so it does not
+       matter whether it came from a drag, a keystroke, a menu row or a
+       background upload — nothing has to remember to announce itself.
+       Before, only a handful of places called out explicitly, which is why
+       typing into a note, or a picture finishing its upload, never reached
+       anybody else. */
+    sent: new Map(),
 
-    // one card changed: send its fields, never the whole document
-    obj(o) {
-      if (!Sync.on || !o || !o.id) return;
-      const f = {};
-      for (const k of Object.keys(o)) if (k[0] !== "_") f[k] = o[k];
-      Net.push(o.id, f);
+    /* A blob: URL means something only inside the window that made it, so
+       it is never sent. Everyone else rebuilds the picture from `ref` and
+       `url`, which point at bytes they can actually fetch. */
+    value(o, k) {
+      if (k[0] === "_") return undefined;
+      const v = o[k];
+      if (k === "src" && typeof v === "string" && (o.ref || o.url) &&
+          (v.slice(0, 5) === "blob:" || v.slice(0, 5) === "data:")) return undefined;
+      return v;
     },
-    del(id) { if (Sync.on) Net.remove(id); },
+
+    scanOne(o) {
+      if (!Sync.on || !o || !o.id) return;
+      let mine = Sync.sent.get(o.id);
+      if (!mine) { mine = {}; Sync.sent.set(o.id, mine); }
+      const f = {};
+      let any = false;
+      for (const k of Object.keys(o)) {
+        const v = Sync.value(o, k);
+        if (v === undefined) continue;
+        const j = JSON.stringify(v);
+        if (mine[k] === j) continue;
+        mine[k] = j;
+        f[k] = v;
+        any = true;
+      }
+      if (any) Net.push(o.id, f);
+    },
+
+    // called after every local commit; the doc is already saved by now
+    push() {
+      if (!Sync.on) return;
+      const live = new Set();
+      for (const o of doc.objs) { live.add(o.id); Sync.scanOne(o); }
+      for (const id of [...Sync.sent.keys()]) {
+        if (live.has(id)) continue;
+        Sync.sent.delete(id);
+        Net.remove(id);
+      }
+      Net.flush(true);
+    },
+
+    // one card changed, right now: used while something is being carried
+    obj(o) { Sync.scanOne(o); if (Sync.on) Net.flush(); },
+    del(id) { if (!Sync.on) return; Sync.sent.delete(id); Net.remove(id); },
+
+    /* An incoming record is already what the room holds, so it is filed as
+       sent: without this every change would be echoed straight back. */
+    seen(op) {
+      if (!op || !op.id || !op.f) return;
+      let mine = Sync.sent.get(op.id);
+      if (!mine) { mine = {}; Sync.sent.set(op.id, mine); }
+      for (const k of Object.keys(op.f)) mine[k] = JSON.stringify(op.f[k]);
+    },
 
     start() {
       if (Sync.on || typeof Net === "undefined") return;
       Sync.on = true;
       Net.connect({
         onHello(objs) {
-          const list = Object.values(objs || {});
-          // empty room: we are the first one in, so publish what we have
+          const list = (Array.isArray(objs) ? objs : Object.values(objs || {})).filter((r) => r && !r.del);
           if (!list.length) {
-            for (const o of doc.objs) Sync.obj(o);
-            Net.flush(true);
+            // empty room: we are the first one in, so publish what we have
+            Sync.push();
+            shareAll();
             return;
           }
-          let dirty = false;
-          for (const rec of list) if (applyOp(rec)) dirty = true;
-          if (dirty) { render(); kick(); }
+          /* The room already has a board. A window that has only ever shown
+             the example board adopts it whole — that is what opening the
+             same link is supposed to mean. Before, the examples stayed and
+             the shared board was merged in underneath them, which is why a
+             second browser sat there looking like nothing had happened. */
+          if (seeded) {
+            doc.objs.length = 0;
+            nodes.forEach((n) => n.remove());
+            nodes.clear();
+            setSelection([], true);
+            seeded = false;
+          }
+          for (const rec of list) { Sync.seen(rec); applyOp(rec); }
+          render(); kick(); rehydrate(); shareAll(); save();
         },
         onOps(ops) {
           let dirty = false;
-          for (const op of ops) if (applyOp(op)) dirty = true;
-          if (dirty) { render(); kick(); save(); }
+          for (const op of ops) { Sync.seen(op); if (applyOp(op)) dirty = true; }
+          if (dirty) { render(); kick(); rehydrate(); save(); }
         },
       });
     },
@@ -72,6 +135,16 @@
   /* merge one incoming record into the local document */
   function applyOp(op) {
     if (!op || !op.id) return false;
+
+    /* A blob: URL is private to the window that made it. If one arrives
+       from somebody else it is dropped: the reference and the room URL
+       beside it are what this window can actually open. This is what made
+       shared pictures arrive as empty cards. */
+    if (op.f && typeof op.f.src === "string" && op.f.src.slice(0, 5) === "blob:") {
+      const f = {};
+      for (const k of Object.keys(op.f)) if (k !== "src") f[k] = op.f[k];
+      op = Object.assign({}, op, { f });
+    }
 
     if (op.del) {
       const i = doc.objs.findIndex((o) => o.id === op.id);
@@ -99,6 +172,10 @@
 
   const blank = () => ({ v: 1, cam: { x: 0, y: 0, z: 1 }, seq: 1, objs: [] });
   let doc = blank();
+  /* True while this window has shown nothing but the example board. Joining
+     a room that already has a board then means adopting it rather than
+     stirring the examples in with somebody's real work. */
+  let seeded = false;
   let undoStack = [], redoStack = [];
   /* `_`-prefixed keys are display state and never persist. A blob: URL is
      throwaway too — it dies with the tab — so it is dropped whenever the
@@ -734,8 +811,13 @@
       const mt = document.createElement("div"); mt.className = "meta";
       body.append(ic, fn, mt);
       renameOn(fn, () => o.name || "file", (v) => { snapshot(); o.name = v; paint(o); save(); Sync.obj(o); });
-      // double-clicking the card still saves it, but not when you meant the name
-      el.addEventListener("dblclick", (e) => { if (!e.target.closest(".fn")) saveFile(o); });
+      /* Double-click an archive and it opens: the card becomes the space of
+         files that was inside it. Anything else saves to disk. Not when you
+         meant the name, though. */
+      el.addEventListener("dblclick", (e) => {
+        if (e.target.closest(".fn")) return;
+        if (isZip(o)) extractZip(o); else saveFile(o);
+      });
     }
 
     if (o.type === "shelf") {
@@ -755,13 +837,16 @@
 
     /* interactions */
     el.addEventListener("pointermove", (e) => {
-      /* In smart draw the card is paper, not a widget: no resize cursor.
-         Holding a modifier suspends drawing, and the handles come back. */
-      if (dragging || (drawMode && !app.classList.contains("bypass"))) { el.style.cursor = ""; return; }
+      /* Borders resize the card, in every mode, smart draw included. While
+         the pointer is in that band the card shows the resize arrow instead
+         of the drawing crosshair, so the edge of a drawing pad is an edge
+         and not somewhere to start a stroke. */
+      if (dragging) { el.style.cursor = ""; el.classList.remove("edge"); return; }
       const d = edgeAt(el, e);
       el.style.cursor = d ? CURSOR[d] : "";
+      el.classList.toggle("edge", !!d);
     });
-    el.addEventListener("pointerleave", () => { el.style.cursor = ""; });
+    el.addEventListener("pointerleave", () => { el.style.cursor = ""; el.classList.remove("edge"); });
 
     el.addEventListener("pointerdown", (e) => {
       if (e.button !== 0) return;
@@ -769,6 +854,15 @@
          land on a card. You can draw straight across notes, images and
          drawings, and nothing resizes, selects or drags underneath. */
       const plain = e.ctrlKey || e.metaKey;
+      /* One exception, and the pointer has already announced it: the border
+         band belongs to the card in every mode. A press there resizes.
+         Without this a drawing pad could not be resized at all — a press on
+         its own edge started a stroke instead. */
+      const band = edgeAt(el, e);
+      if (drawMode && !plain && band) {
+        e.preventDefault(); e.stopPropagation();
+        return startResize(e, o, band);
+      }
       if (drawMode && !plain) { e.preventDefault(); e.stopPropagation(); beginStroke(e); return; }
       /* Holding a modifier with smart draw on means "forget the ink and
          just handle the card": grab it, resize it, drop a caret in it.
@@ -776,8 +870,7 @@
       if (plain && !drawMode) { e.preventDefault(); e.stopPropagation(); select(o.id, true); return; }
       if (!selected.has(o.id)) select(o.id);
       front(o);
-      const d = edgeAt(el, e);
-      if (d) return startResize(e, o, d);
+      if (band) return startResize(e, o, band);
       const hard = e.target.closest("canvas,video,iframe,.rail,.pal,button,select,input,a");
       if (hard) return;
       /* text is draggable too: press and move to carry the card, press and
@@ -1021,11 +1114,28 @@
     return SHELF_PAD * 2 + n * ROW_H + (n - 1) * ROW_GAP;
   }
 
+  /* Anything with a file behind it can live in a space: a dropped file, a
+     picture, a clip, a page, a code card. The row is the same three facts in
+     every case, so gathering works for all of them and not just files. */
+  const SHELVABLE = ["file", "shelf", "image", "video", "code", "web"];
+  const canShelve = (o) => !!o && SHELVABLE.includes(o.type);
+  const defaultName = (o) =>
+    o.type === "code" ? "untitled." + (o.lang && o.lang !== "txt" ? o.lang : "txt")
+      : o.type === "image" ? "image.png"
+        : o.type === "video" ? "video.mp4"
+          : o.type === "web" ? "page.html" : "file";
+  const isZip = (o) => !!o && (o.mime === "application/zip" || ext(o.name) === "zip");
+
   /* what a card looks like once it is a row: a name and a reference */
-  const rowOf = (o) => ({
-    name: o.name || "file", mime: o.mime || "", size: o.size || 0,
-    ref: o.ref || null, url: o.url || "", src: o.src || "",
-  });
+  const rowOf = (o) => {
+    const it = {
+      name: o.name || defaultName(o), mime: o.mime || "", size: o.size || 0,
+      ref: o.ref || null, url: o.url || "", src: o.src || "",
+    };
+    // a code card's file is its own text, so the text travels with the row
+    if (o.type === "code") { it.text = o.src || ""; it.src = ""; it.size = it.text.length; }
+    return it;
+  };
   const rowsOf = (o) => (o.type === "shelf" ? (o.items || []).slice() : [rowOf(o)]);
 
   /* one row: icon, name, size — the same three things a file card shows,
@@ -1042,24 +1152,31 @@
     const at = () => (o.items || [])[+row.dataset.i] || null;
     renameOn(fn, () => (at() || {}).name || "file",
       (v) => { const it = at(); if (!it) return; snapshot(); it.name = v; paint(o); save(); Sync.obj(o); });
-    row.addEventListener("dblclick", (e) => { const it = at(); if (it && !e.target.closest(".fn")) saveFile(it); });
+    /* Double-click a row and the space packs itself into one archive — the
+       reverse of double-clicking an archive to open it back out. */
+    row.addEventListener("dblclick", (e) => { if (!e.target.closest(".fn")) zipShelf(o); });
     return row;
   }
 
   /* Dropping a file on a file, or on a shelf, gathers them. This is the
      only way a shelf is born and the only way one grows. Returns true when
      the drop was consumed, so the caller leaves the cards alone. */
-  function gatherOnDrop(o, set, ev) {
-    if (!ev || set.length !== 1) return false;
+  // what this drop would gather into, if it were let go right now
+  function gatherTarget(o, set, ev) {
+    if (!ev || set.length !== 1) return null;
     const src = set[0];
-    if (!src || (src.type !== "file" && src.type !== "shelf")) return false;
-
+    if (!canShelve(src)) return null;
     const p = toWorld(ev.clientX, ev.clientY);
-    const hit = doc.objs
-      .filter((t) => t !== src && (t.type === "file" || t.type === "shelf"))
+    return doc.objs
+      .filter((t) => t !== src && canShelve(t))
       .filter((t) => { const r = rectOf(t); return r && p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h; })
-      .pop();
+      .pop() || null;
+  }
+
+  function gatherOnDrop(o, set, ev) {
+    const hit = gatherTarget(o, set, ev);
     if (!hit) return false;
+    const src = set[0];
 
     const items = rowsOf(hit).concat(rowsOf(src));
     if (hit.type === "shelf") {
@@ -1092,26 +1209,41 @@
     const from = rows.indexOf(row);
     const step = (ROW_H + ROW_GAP) * (cam().z || 1);
     const y0 = e.clientY;
-    let to = from, lifted = false;
+    let to = from, lifted = false, outAt = 0, out = false;
 
     const move = (ev) => {
       const dy = ev.clientY - y0;
       if (!lifted) {
-        if (Math.abs(dy) < 4) return;
+        if (Math.abs(dy) < 4 && Math.abs(ev.clientX - e.clientX) < 4) return;
         lifted = true;
         row.classList.add("lift");
         snapshot();
       }
+      /* Carried clear of the card and kept there for a moment, the row
+         leaves the space and lands on the board as its own card. The moment
+         of waiting is what stops a wobbly reorder from throwing files out. */
+      const card = nodes.get(o.id);
+      const r = card ? card.getBoundingClientRect() : null;
+      const outside = !!r && (ev.clientX < r.left - 20 || ev.clientX > r.right + 20 ||
+        ev.clientY < r.top - 20 || ev.clientY > r.bottom + 20);
+      if (!outside) { outAt = 0; out = false; }
+      else if (!outAt) outAt = performance.now();
+      else out = performance.now() - outAt > 220;
+      row.classList.toggle("away", out);
+      if (out) return;
+
       const want = Math.max(0, Math.min(rows.length - 1, from + Math.round(dy / step)));
       if (want === to) return;
       to = want;
-      const order = rows.filter((r) => r !== row);
+      const order = rows.filter((r2) => r2 !== row);
       order.splice(to, 0, row);
-      order.forEach((r) => inner.appendChild(r));
+      order.forEach((r2) => inner.appendChild(r2));
     };
-    const up = () => {
+    const up = (ev) => {
       row.classList.remove("lift");
+      row.classList.remove("away");
       if (!lifted) return;
+      if (out && ev) return popRow(o, from, toWorld(ev.clientX, ev.clientY));
       if (to !== from) {
         const list = o.items || [];
         const [it] = list.splice(from, 1);
@@ -1121,6 +1253,53 @@
       paint(o);
     };
     pointerSession({ move, up, grab: true });
+  }
+
+  /* A row lifted out of a space becomes the card it would have been had it
+     been dropped on the board: a picture as a picture, a clip as a clip,
+     text as code, anything else as a file. */
+  function cardFromRow(it, at) {
+    const spot = freeSpot(Math.round(at.x - 96), Math.round(at.y - 24), 192, 156);
+    const base = {
+      name: it.name, mime: it.mime || "", size: it.size || 0,
+      ref: it.ref || null, url: it.url || "", src: it.src || "",
+    };
+    let o;
+    if (it.text != null) {
+      o = { type: "code", w: 372, h: 216, src: it.text, lang: guessLang(it.text), name: it.name, md: false, wrap: false };
+    } else if (/^image\//.test(base.mime) || IMG_RX.test(base.name || "")) {
+      o = Object.assign({ type: "image", w: 280, h: 200, fit: "contain" }, base);
+    } else if (/^video\//.test(base.mime) || VID_RX.test(base.name || "")) {
+      o = Object.assign({ type: "video", w: 336, h: 216, kind: "file", fit: "cover", muted: true, controls: true }, base);
+    } else {
+      o = Object.assign({ type: "file", w: 192, h: 156 }, base);
+    }
+    o.id = uid(); o.x = spot.x; o.y = spot.y;
+    sync(o); doc.objs.push(o);
+    return o;
+  }
+
+  /* Take one row out of a space. A space holding a single row is not a
+     space, so it collapses into that card and the shelf goes away. */
+  function popRow(o, i, at) {
+    const list = o.items || [];
+    const it = list[i];
+    if (!it) return;
+    list.splice(i, 1);
+    const card = cardFromRow(it, at);
+    if (list.length <= 1) {
+      if (list.length === 1) {
+        const r = rectOf(o) || { x: o.x, y: o.y };
+        const only = cardFromRow(list[0], { x: r.x + 96, y: r.y + 24 });
+        only.x = r.x; only.y = r.y; sync(only);
+      }
+      doc.objs = doc.objs.filter((t) => t !== o);
+      Sync.del(o.id);
+    } else {
+      o.h = shelfHeight(o);
+      Sync.obj(o);
+    }
+    render(); save(); select(card.id);
   }
 
   function naturalSize(o, quiet) {
@@ -1192,10 +1371,7 @@
         { name: f.name, mime: f.type || "text/html", size: f.size });
       if (rec) o.ref = rec.ref;
       paint(o); save();
-      if (rec && typeof Net !== "undefined" && Net.online()) {
-        const up = await Store.share(rec.ref);
-        if (up && up.url) { o.url = up.url; save(); Sync.obj(o); }
-      }
+      if (rec) await shareOne(o);
       return;
     }
 
@@ -1228,10 +1404,33 @@
     if (rec) o.ref = rec.ref;
     save();
 
-    // share the bytes with the room, then remember where they landed
-    if (rec && typeof Net !== "undefined" && Net.online()) {
-      const up = await Store.share(rec.ref);
-      if (up && up.url) { o.url = up.url; save(); Sync.obj(o); }
+    /* Upload the bytes and remember where they landed. This used to happen
+       only while the room happened to be up, so a file dropped on a quiet
+       board was stored nowhere but this browser and nobody else could ever
+       open it. */
+    if (rec) await shareOne(o);
+  }
+
+  /* Put what is held locally into the room's store, so the rest of the team
+     can open it. The server addresses files by their contents, so sharing
+     the same bytes twice costs one request and stores nothing twice. */
+  async function shareOne(o) {
+    if (!o || !o.ref || typeof Store === "undefined") return null;
+    const up = await Store.share(o.ref).catch(() => null);
+    if (up && up.url && up.url !== o.url) { o.url = up.url; save(); Sync.obj(o); }
+    return up;
+  }
+
+  async function shareAll() {
+    if (typeof Store === "undefined") return;
+    for (const o of doc.objs) {
+      if (o.ref && !o.url) await shareOne(o);
+      if (o.type !== "shelf") continue;
+      for (const it of o.items || []) {
+        if (!it.ref || it.url) continue;
+        const up = await Store.share(it.ref).catch(() => null);
+        if (up && up.url) { it.url = up.url; save(); Sync.obj(o); }
+      }
     }
   }
 
@@ -1239,12 +1438,30 @@
      room's copy, which is also cached locally on the way through. */
   async function rehydrate() {
     if (typeof Store === "undefined") return;
-    for (const o of doc.objs) {
-      if (!o.ref || (o.src && o.src.slice(0, 5) === "blob:")) continue;
+    /* One card or one row, it makes no difference: anything that names bytes
+       gets a URL this window can actually open — the local copy first, then
+       the room's, which is cached locally on the way through. A card that
+       arrived from somebody else has no local copy at all, and this is where
+       it gets one. */
+    const fix = async (h) => {
+      if (!h || (!h.ref && !h.url)) return false;
+      if (h.src && h.src.slice(0, 5) === "blob:") return false;
+      if (!h.ref) {
+        if (h.url && h.src !== h.url) { h.src = h.url; return true; }
+        return false;
+      }
       try {
-        const u = await Store.url(o.ref, o.url);
-        if (u && u !== o.src) { o.src = u; paint(o); }
+        const u = await Store.url(h.ref, h.url);
+        if (u && u !== h.src) { h.src = u; return true; }
       } catch (e) { /* the bytes are gone; the card stays, just empty */ }
+      return false;
+    };
+    for (const o of doc.objs) {
+      if (await fix(o)) paint(o);
+      if (o.type !== "shelf") continue;
+      let any = false;
+      for (const it of o.items || []) if (await fix(it)) any = true;
+      if (any) paint(o);
     }
   }
 
@@ -1577,6 +1794,27 @@
       set.forEach((t) => { if (isBox(t)) t._liftT = 1; });
       kick();
     };
+    /* Carried on top of another file and held still, the card underneath
+       answers with a slow pulse: letting go now gathers them into one space.
+       Moving again puts the timer back to the start, so passing over a card
+       on the way somewhere else does not flash it. */
+    let hintEl = null, hintT = 0;
+    const clearHint = () => {
+      if (hintT) { clearTimeout(hintT); hintT = 0; }
+      if (hintEl) { hintEl.classList.remove("gather"); hintEl = null; }
+    };
+    const gatherHint = (ev) => {
+      const t = gatherTarget(o, set, ev);
+      if (hintT) { clearTimeout(hintT); hintT = 0; }
+      if (hintEl && (!t || nodes.get(t.id) !== hintEl)) { hintEl.classList.remove("gather"); hintEl = null; }
+      if (!t || hintEl) return;
+      hintT = setTimeout(() => {
+        hintT = 0;
+        hintEl = nodes.get(t.id) || null;
+        if (hintEl) hintEl.classList.add("gather");
+      }, 260);
+    };
+
     let moved = false;
     closeMenu();
     const move = (ev) => {
@@ -1601,9 +1839,15 @@
       }
       kick(); drawVectors();
       Net.cursor(p.x, p.y, true);
+      gatherHint(ev);
+      /* Other windows watch the card travel instead of seeing it jump when
+         it lands. The network layer throttles this down to a packet every
+         few frames, so it costs a fraction of what the cursor stream does. */
+      set.forEach(Sync.obj);
     };
     const up = (ev) => {
       shield(false);
+      clearHint();
       set.forEach((t) => { if (isBox(t)) t._liftT = 0; });
       if (moved) {
         // dropped onto another file, or onto a shelf: they gather up
@@ -1783,11 +2027,45 @@
     return null;
   }
 
+  /* A dot dropped on a card's border stays on that border. What is kept is
+     the card and the spot along its edge as a fraction, so the point rides
+     along while the card is moved or resized, survives a reload, and reads
+     the same for everybody in the room. */
+  const pinKey = (kind, key) => (kind === "pts" ? "p" + key : kind === "end" ? "e" + key : null);
+
+  function unpin(o, k) {
+    if (!o.pins || !k || !o.pins[k]) return false;
+    delete o.pins[k];
+    if (!Object.keys(o.pins).length) delete o.pins;
+    return true;
+  }
+
+  function applyPins(o) {
+    if (!o.pins) return;
+    for (const k of Object.keys(o.pins)) {
+      const a = o.pins[k];
+      const t = a && byId(a.id);
+      const r = t && rectOf(t);
+      // the card it was fastened to is gone: the point is just a point again
+      if (!r) { delete o.pins[k]; continue; }
+      const p = { x: r.x + a.ax * r.w, y: r.y + a.ay * r.h };
+      if (k[0] === "p") {
+        const i = +k.slice(1);
+        if (o.pts && o.pts[i]) o.pts[i] = p; else delete o.pins[k];
+      } else {
+        const s = k.slice(1);
+        if (o[s]) o[s] = p; else delete o.pins[k];
+      }
+    }
+    if (!Object.keys(o.pins).length) delete o.pins;
+  }
+
   const VEC = ["curve", "line", "arrow", "rect", "ellipse", "poly", "link"];
   function drawVectors() {
     inkBody.textContent = "";
     for (const o of doc.objs) {
       if (!VEC.includes(o.type)) continue;
+      applyPins(o);
       const d = shapeD(o);
       if (!d) continue;
       const g = el("g", { "data-id": o.id });
@@ -1802,13 +2080,20 @@
       g.appendChild(p);
 
       const e = endsOf(o);
+      /* The head is part of the arrow you can grab. It used to be paint
+         only: clicking the cone itself selected nothing, so the one part of
+         an arrow people aim for was the one part that never answered. */
       if (e && (o.type === "arrow" || o.arrow)) {
-        const h = el("path", { class: "shape", d: headD(e.tip, e.prev, w, o.head), "stroke-width": w });
+        const hd = headD(e.tip, e.prev, w, o.head);
+        g.appendChild(el("path", { class: "hit", d: hd }));
+        const h = el("path", { class: "shape", d: hd, "stroke-width": w });
         if (o.color) h.style.stroke = o.color;
         g.appendChild(h);
       }
       if (e && o.arrowStart) {
-        const h = el("path", { class: "shape", d: headD(e.tail, e.next, w, o.headStart), "stroke-width": w });
+        const hd = headD(e.tail, e.next, w, o.headStart);
+        g.appendChild(el("path", { class: "hit", d: hd }));
+        const h = el("path", { class: "shape", d: hd, "stroke-width": w });
         if (o.color) h.style.stroke = o.color;
         g.appendChild(h);
       }
@@ -1840,15 +2125,25 @@
     /* The two barbs of an arrowhead get handles of their own, sitting on
        their own tips. A head is made at one universal size, and from there
        either side can be carried wherever you want it. */
+    /* Both ends of an arrow carry their own head, so both get their own
+       pair of dots: the head at the tail is shaped exactly like the head at
+       the tip, from whichever side it happens to be on. */
     const barbHandles = () => {
-      if (!(o.type === "arrow" || o.arrow)) return;
       const e = endsOf(o);
-      if (!e || !e.prev) return;
-      const heading = Math.atan2(e.tip.y - e.prev.y, e.tip.x - e.prev.x);
+      if (!e) return;
       const scale = 1 + (o.wdt || 2) * 0.22;
-      G.headStrokes(e.tip, heading, o.head, scale).forEach((s, i) => {
-        inkHandles.appendChild(node(s.to.x, s.to.y, "barb", { barb: i }));
-      });
+      if ((o.type === "arrow" || o.arrow) && e.prev) {
+        const heading = Math.atan2(e.tip.y - e.prev.y, e.tip.x - e.prev.x);
+        G.headStrokes(e.tip, heading, o.head, scale).forEach((s, i) => {
+          inkHandles.appendChild(node(s.to.x, s.to.y, "barb", { barb: i }));
+        });
+      }
+      if (o.arrowStart && e.next) {
+        const heading = Math.atan2(e.tail.y - e.next.y, e.tail.x - e.next.x);
+        G.headStrokes(e.tail, heading, o.headStart, scale).forEach((s, i) => {
+          inkHandles.appendChild(node(s.to.x, s.to.y, "barb", { barbs: i }));
+        });
+      }
     };
 
     if (o.type === "curve" || o.type === "poly") {
@@ -2361,6 +2656,8 @@
 
   async function bytesOf(o) {
     if (o.type === "code") return new TextEncoder().encode(o.src || "");
+    // a code card that became a row carries its text instead of a reference
+    if (o.text != null) return new TextEncoder().encode(o.text);
     /* The local copy first: a blob: URL from a previous session is dead
        after a reload, and fetching it throws instead of returning bytes. */
     if (o.ref && typeof Store !== "undefined") {
@@ -2412,38 +2709,38 @@
     toast(`${entries.length} files, zipped`);
   }
 
-  /* just clear of a card, on its right */
-  const nearOf = (o) => {
-    const r = rectOf(o) || { x: o.x || 0, y: o.y || 0, w: 0, h: 0 };
-    return { x: r.x + r.w + 120, y: r.y + 24 };
-  };
-
-  /* Right click → Zip. The archive becomes a file card of its own, the
-     same size as any other file card, standing next to what it came from.
-     The originals stay exactly where they are. */
-  async function zipCard(list, at) {
-    const used = new Set();
-    let entries = [];
-    for (const o of list) entries = entries.concat(await entriesFor(o, used));
+  /* Packing up a space: the rows go into one archive and the space is
+     replaced by that archive, in the same place and at the same size. It is
+     the exact reverse of opening one, so a double-click either way walks
+     the same board back and forth between the two shapes. */
+  async function zipShelf(o) {
+    if (typeof Zip === "undefined") return toast("zipping is not available here");
+    if (!o || o.type !== "shelf") return;
+    const entries = await entriesFor(o, new Set());
     if (!entries.length) return toast("nothing to zip");
 
     let packed;
     try { packed = await Zip.write(entries); }
     catch (e) { console.warn("[space] zip failed", e); return toast("could not pack these files"); }
 
-    const stem = list.length === 1 && list[0].name
-      ? String(list[0].name).replace(/\.[^.]+$/, "") : "archive";
-    const name = (stem || "archive") + ".zip";
-
+    const name = (o.name || "archive").replace(/\.zip$/i, "") + ".zip";
     let rec = null;
     try { rec = await Store.putBytes(packed, name, "application/zip"); }
     catch (e) { console.warn("[space] local file store failed", e); }
 
-    const o = mkFile(at, {
+    const r = rectOf(o) || { x: o.x || 0, y: o.y || 0 };
+    snapshot();
+    const card = {
+      type: "file", id: uid(), x: r.x, y: r.y, w: 192, h: 156,
       name, mime: "application/zip", size: packed.length,
-      src: rec ? rec.url : "", ref: rec ? rec.ref : null,
-    });
-    save(); Sync.obj(o);
+      src: rec ? rec.url : "", ref: rec ? rec.ref : null, url: "",
+    };
+    sync(card);
+    doc.objs = doc.objs.filter((t) => t !== o);
+    doc.objs.push(card);
+    Sync.del(o.id);
+    render(); save(); Sync.obj(card); select(card.id);
+    shareOne(card);
     toast(`zipped ${entries.length} files`);
   }
 
@@ -2471,15 +2768,19 @@
     }
     if (!items.length) return toast("the archive is empty");
 
+    /* The archive is replaced by what was in it, in the same place and at
+       least as wide: opening something puts you inside it, rather than
+       leaving a copy of the closed thing lying next to the open one. */
     const r = rectOf(o) || { x: o.x || 0, y: o.y || 0, w: 192, h: 156 };
     snapshot();
-    const shelf = { type: "shelf", id: uid(), w: 320, items };
+    const shelf = { type: "shelf", id: uid(), x: r.x, y: r.y, w: Math.max(320, r.w), items, name: o.name };
     shelf.h = shelfHeight(shelf);
-    const spot = freeSpot(r.x + r.w + 24, r.y, shelf.w, shelf.h);
-    shelf.x = spot.x; shelf.y = spot.y;
     sync(shelf);
+    doc.objs = doc.objs.filter((t) => t !== o);
     doc.objs.push(shelf);
+    Sync.del(o.id);
     render(); save(); Sync.obj(shelf); select(shelf.id);
+    shareAll();
     toast(`${items.length} files extracted`);
   }
 
@@ -2536,7 +2837,8 @@
     }
 
     if (o.type === "shelf") {
-      items.push({ label: "Zip", run: () => zipCard([o], nearOf(o)) });
+      // only a space of files can be packed up, and it packs up in place
+      items.push({ label: "Zip", run: () => zipShelf(o) });
       items.push({ sep: 1 });
     }
 
@@ -2575,8 +2877,6 @@
     const haul = downloadSet(o);
     if (haul.length === 1) items.push({ label: "Download", run: () => downloadObject(haul[0]) });
     else if (haul.length > 1) items.push({ label: `Download ${haul.length} as .zip`, run: () => downloadZip(haul) });
-    // Zip keeps the archive on the board instead of sending it to disk
-    if (haul.length && o.type !== "shelf") items.push({ label: "Zip", run: () => zipCard(haul, nearOf(o)) });
     items.push({ label: "Copy", run: () => copyObject(o) });
     items.push({ label: "Delete", hot: 1, run: () => remove(o) });
     openMenu(x, y, items);
@@ -2609,7 +2909,7 @@
       { label: "Couple", run: () => setTidy(true) },
       { sep: 1 },
       { label: "Paste here", run: () => pasteFromClipboard(at) },
-      { label: "Reset view", run: () => { camT.x = 0; camT.y = 0; camT.z = 1; kick(); } },
+      { label: "Reset view", run: () => { centerContent(); kick(); } },
     ]);
   }
 
@@ -2946,6 +3246,7 @@
     }
     drawVectors();
     blinkNode(Math.min(key, hit));
+    return true;
   }
 
   /* dragging a spline node moves that node only — nothing else shifts */
@@ -2955,17 +3256,24 @@
     const origin = home ? { x: home.x, y: home.y } : null;
     let far = !origin;
 
-    /* Press and hold on a seam and the outline opens back up. Carrying the
-       node somewhere and then resting does not count: the timer is armed
-       only while the node has never left where it started. */
+    const pk = pinKey(kind, key);
+    let pin = null;
+
+    /* Press and hold a dot, without wandering off it, and whatever it is
+       fastened to lets go: a dot pinned to a card's border comes off the
+       border, and the seam of a closed outline opens the outline back up.
+       Carrying the dot somewhere and then resting does not count — the timer
+       is armed only while it has never left where it started. */
+    const holds = pk && o.pins && o.pins[pk] ? "pin" : isSeam(o, kind, key) ? "seam" : "";
     let hold = 0;
-    if (isSeam(o, kind, key)) {
+    if (holds) {
       hold = setTimeout(() => {
         hold = 0;
         if (far) return;
         snapshot();
-        o.closed = false;
-        drawVectors(); save();
+        if (holds === "pin") unpin(o, pk);
+        else o.closed = false;
+        drawVectors(); save(); Sync.obj(o);
         blinkNode(key);
       }, HOLD_MS);
     }
@@ -2978,35 +3286,53 @@
       }
       if (!far) return;                     // a hand tremor is not a drag
       if (!moved) { snapshot(); moved = true; }
-      if (kind === "pts") o.pts[key] = { x: p.x, y: p.y };
-      else if (kind === "end") o[key] = { x: p.x, y: p.y };
-      else if (kind === "mid") {
+      if (kind === "pts" || kind === "end") {
+        /* Carry an end over a card and it grips the border, sliding along it
+           as you move — the same grip a connector uses. Let go anywhere else
+           and it is an ordinary point again. */
+        pin = anchorNear(p);
+        showAnchor(anchorA, pin);
+        const q = pin ? { x: pin.x, y: pin.y } : { x: p.x, y: p.y };
+        if (kind === "pts") o.pts[key] = q; else o[key] = q;
+      } else if (kind === "mid") {
         const F = linkFrame(o);
         if (F) { const l = linkLocal(F, p); o.mid[key] = l; }
-      } else if (kind === "barb") {
+      } else if (kind === "barb" || kind === "barbStart") {
         /* A barb is kept as a length and an angle relative to where the
            line is heading, not as a point: move or bend the arrow later and
            the head still points the right way. */
         const e = endsOf(o);
-        if (e && e.prev) {
-          const heading = Math.atan2(e.tip.y - e.prev.y, e.tip.x - e.prev.x);
+        const start = kind === "barbStart";
+        const tip = e && (start ? e.tail : e.tip);
+        const from = e && (start ? e.next : e.prev);
+        if (tip && from) {
+          const heading = Math.atan2(tip.y - from.y, tip.x - from.x);
           const scale = 1 + (o.wdt || 2) * 0.22;
-          const len = Math.hypot(p.x - e.tip.x, p.y - e.tip.y) / scale;
-          let ang = Math.atan2(p.y - e.tip.y, p.x - e.tip.x) - heading;
+          const len = Math.hypot(p.x - tip.x, p.y - tip.y) / scale;
+          let ang = Math.atan2(p.y - tip.y, p.x - tip.x) - heading;
           ang = Math.atan2(Math.sin(ang), Math.cos(ang));   // never wrap the long way
-          o.head = o.head || {};
-          if (!o.head.barbs || o.head.barbs.length < 2) {
+          const slot = start ? "headStart" : "head";
+          o[slot] = o[slot] || {};
+          if (!o[slot].barbs || o[slot].barbs.length < 2) {
             const d = 13, a = Math.PI * 0.82;
-            o.head.barbs = [{ len: d, ang: a }, { len: d, ang: -a }];
+            o[slot].barbs = [{ len: d, ang: a }, { len: d, ang: -a }];
           }
-          o.head.barbs[key] = { len: Math.max(4, Math.min(60, len)), ang };
+          o[slot].barbs[key] = { len: Math.max(4, Math.min(60, len)), ang };
         }
       }
       drawVectors();
     };
     const up = () => {
       disarm();
-      if (moved) { fuseNode(o, kind, key); save(); Sync.obj(o); }
+      anchorA.classList.remove("on");
+      if (!moved) return;
+      if (pk) {
+        if (pin) { o.pins = o.pins || {}; o.pins[pk] = { id: pin.id, ax: pin.ax, ay: pin.ay }; }
+        else unpin(o, pk);
+      }
+      // fusing renumbers the points, so any pin on this shape is let go
+      if (fuseNode(o, kind, key) && o.pins) delete o.pins;
+      save(); Sync.obj(o);
     };
     pointerSession({ move, up, grab: true });
   }
@@ -3089,6 +3415,7 @@
         drawVectors(); save();
         return;
       }
+      if (t.dataset.barbs != null) return startNodeDrag(o, "barbStart", +t.dataset.barbs);
       if (t.dataset.barb != null) return startNodeDrag(o, "barb", +t.dataset.barb);
       if (t.dataset.i != null) return startNodeDrag(o, "pts", +t.dataset.i);
       if (t.dataset.end) return startNodeDrag(o, "end", t.dataset.end);
@@ -3289,36 +3616,51 @@
    * ------------------------------------------------------------------ */
   function seed() {
     const mk = (o) => { o.id = uid(); sync(o); doc.objs.push(o); return o; };
-    const a = mk({ type: "note", x: -432, y: -204, w: 264, h: 204, size: 13.5,
-      body: "Space\n\nRight click anywhere.\n\nDrag a card from any edge, resize from any edge.\nCtrl+drag on empty space to box-select.\nCtrl+wheel to zoom." });
-    mk({ type: "note", x: -48, y: -180, w: 252, h: 168, size: 13.5,
-      body: "Smart draw\n\nTurn it on, then sketch:\nlines, arrows, circles,\nsquares, triangles, polygons —\nor drag border to border to link.\n\nHold Ctrl to move things instead." });
-    mk({ type: "code", x: -48, y: 36, w: 372, h: 192, lang: "js", md: false,
-      src: "// paste code from anywhere —\n// the language is detected for you\nconst board = { local: true }\n\nexport const save = (doc) =>\n  localStorage.setItem('space.doc.v1', JSON.stringify(doc))" });
-    mk({ type: "curve", wdt: 2, arrow: true, color: PALETTE[3],
-      pts: [{ x: 264, y: -144 }, { x: 348, y: -204 }, { x: 432, y: -150 }, { x: 468, y: -60 }] });
-    mk({ type: "ellipse", x: 396, y: 60, w: 132, h: 132, wdt: 2, color: PALETTE[6] });
-    /* frame the seeded board in the viewport, so a first load opens on the
-       content rather than on empty space (Reset view returns here) */
+    /* Two rows of three around the origin: what you can do, how to draw,
+       how files work, then a clip, a page and a formula. Six cards is the
+       whole tour, and the camera frames them. */
+    mk({ type: "note", x: -564, y: -276, w: 264, h: 252, size: 13.5,
+      body: "Space\n\nRight click anything — that is the whole menu.\n\nDrag a card by its middle, resize it from\nany border.\n\nCtrl+drag empty space to box-select\nCtrl+wheel to zoom · Ctrl+Z to undo\nN note · S drawing · C code · D smart draw" });
+    mk({ type: "note", x: -288, y: -276, w: 264, h: 252, size: 13.5,
+      body: "Smart draw\n\nPress D, then sketch: lines, arrows, circles,\nsquares, triangles. Rough is fine.\n\nDrop the end of a line on a card's border\nand it sticks there, sliding along it.\nHold a dot still to let it go again.\n\nHold Ctrl to move things instead." });
+    mk({ type: "code", x: -12, y: -276, w: 312, h: 252, lang: "md", md: true, wrap: true,
+      src: "### Files\n\nDrop anything on the board. Drop one file\n**on top of another** and they become a\n*file space*.\n\n- double-click a row — the space zips up\n- double-click a `.zip` — it opens again\n- drag a row out to lift that file free" });
+    mk({ type: "video", x: -564, y: 0, w: 336, h: 216, kind: "embed", fit: "cover",
+      src: "https://www.youtube.com/embed/jNQXAC9IVRw", muted: true, controls: true });
+    mk({ type: "web", x: -216, y: 0, w: 300, h: 216, render: false, mime: "text/html",
+      name: "Zoo — Wikipedia", src: "https://en.wikipedia.org/wiki/Zoo" });
+    mk({ type: "code", x: 96, y: 0, w: 264, h: 216, lang: "math", md: true, wrap: true,
+      src: "\\int_{-\\infty}^{\\infty} e^{-x^{2}}\\,dx = \\sqrt{\\pi}" });
+    centerContent();
+  }
+
+  /* Put whatever is on the board in the middle of the window. The camera
+     moves, never the cards: where this window is looking is its own
+     business, while shifting the cards would drag the board sideways for
+     everyone else too. The old pass moved the cards by a grid-rounded
+     amount, which is how the examples ended up in a corner. */
+  function centerContent() {
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-    doc.objs.forEach((o) => {
-      const r = objBBox(o); if (!r) return;
+    for (const o of doc.objs) {
+      const r = objBBox(o); if (!r) continue;
       x0 = Math.min(x0, r.x); y0 = Math.min(y0, r.y);
       x1 = Math.max(x1, r.x + r.w); y1 = Math.max(y1, r.y + r.h);
-    });
-    if (isFinite(x0)) {
-      const dx = Math.round((innerWidth / 2 - (x0 + x1) / 2) / CELL) * CELL;
-      const dy = Math.round((innerHeight / 2 - (y0 + y1) / 2) / CELL) * CELL;
-      doc.objs.forEach((o) => {
-        if (isBox(o)) { o.x += dx; o.y += dy; } else shiftVector(o, dx, dy);
-        sync(o);
-      });
     }
-    void a;
+    if (!isFinite(x0)) { camT.x = 0; camT.y = 0; camT.z = 1; }
+    else {
+      // zoom out only as far as it takes to hold everything, never further
+      const fit = Math.min((innerWidth - 96) / (x1 - x0), (innerHeight - 96) / (y1 - y0));
+      camT.z = fit >= 1 ? 1 : Math.max(0.3, Math.round(fit * 100) / 100);
+      camT.x = innerWidth / 2 - ((x0 + x1) / 2) * camT.z;
+      camT.y = innerHeight / 2 - ((y0 + y1) / 2) * camT.z;
+    }
+    const c = cam();
+    c.x = camT.x; c.y = camT.y; c.z = camT.z;
+    applyCam();
   }
 
   load();
-  if (!doc.objs.length) { seed(); save(); }
+  if (!doc.objs.length) { seed(); seeded = true; save(); }
   syncCam();
   fitScratch();
 
